@@ -7,13 +7,11 @@ from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
 
-APP_VERSION = "v13 (Apple-ish cute Yellow/Black)"
-
+# -------------------------
+# Page + Professional UI
+# -------------------------
 st.set_page_config(page_title="Grouping Studio", layout="wide")
 
-# -------------------------
-# Apple-ish Yellow/Black UI (cute + professional)
-# -------------------------
 st.markdown(
     """
     <style>
@@ -22,98 +20,75 @@ st.markdown(
       footer {visibility: hidden;}
       header {visibility: hidden;}
 
-      /* Typography */
-      html, body, [class*="css"]  {
-        font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "SF Pro Display",
-                     "SF Pro Text", "Segoe UI", Inter, Roboto, Helvetica, Arial, sans-serif;
-      }
-
-      /* Apple-like soft background */
+      /* Professional neutral background */
       .stApp{
-        background:
-          radial-gradient(900px 520px at 18% 10%, rgba(255,214,10,.22), transparent 60%),
-          radial-gradient(820px 520px at 85% 22%, rgba(0,0,0,.10), transparent 62%),
-          radial-gradient(720px 520px at 30% 92%, rgba(255,214,10,.14), transparent 60%),
-          linear-gradient(180deg, #FFFDF6 0%, #FFF9E8 55%, #FFFDF6 100%);
+        background: linear-gradient(180deg, #FAFAFA 0%, #F5F5F7 100%);
       }
 
-      /* Container spacing */
+      /* Layout */
       .block-container{
-        padding-top: 1.05rem;
-        padding-bottom: 2.25rem;
+        padding-top: 1.1rem;
+        padding-bottom: 2.2rem;
         max-width: 1180px;
       }
 
-      /* Subtle “glass” nav bar */
-      .nav {
+      /* Top bar */
+      .topbar{
         display:flex;
         align-items:center;
         justify-content:space-between;
         gap:1rem;
-        padding: 0.85rem 1.05rem;
-        border-radius: 22px;
-        background: rgba(255,255,255,.66);
-        border: 1px solid rgba(17,24,39,.08);
-        box-shadow: 0 16px 42px rgba(15,23,42,.07);
+        padding: 0.95rem 1.05rem;
+        border-radius: 16px;
+        background: rgba(255,255,255,.85);
+        border: 1px solid rgba(0,0,0,.08);
+        box-shadow: 0 14px 40px rgba(0,0,0,.07);
         backdrop-filter: blur(10px);
         margin-bottom: 0.9rem;
       }
       .brand{
-        display:flex;
-        align-items:center;
-        gap:.6rem;
+        display:flex; align-items:center; gap:.75rem;
       }
-      .logo{
-        width: 34px; height: 34px;
-        border-radius: 12px;
+      .mark{
+        width: 34px; height: 34px; border-radius: 10px;
         background: linear-gradient(135deg, #111827, #0B0B0F);
-        position: relative;
-        box-shadow: 0 10px 22px rgba(0,0,0,.18);
-      }
-      .logo::after{
-        content:"";
-        position:absolute;
-        width: 12px; height: 12px;
-        border-radius: 50%;
-        right: -5px; top: -5px;
-        background: linear-gradient(135deg, #FFD60A, #FFE37A);
-        border: 2px solid rgba(255,255,255,.85);
+        box-shadow: 0 10px 22px rgba(0,0,0,.20);
       }
       .title{
         margin:0;
-        font-size: 1.08rem;
+        font-size: 1.1rem;
         font-weight: 900;
-        letter-spacing: .2px;
         color: rgba(17,24,39,.92);
+        letter-spacing: .2px;
       }
       .subtitle{
         margin:.1rem 0 0;
         font-size: .9rem;
-        color: rgba(17,24,39,.62);
+        color: rgba(17,24,39,.60);
       }
-      .tag{
-        display:inline-block;
-        padding: .25rem .6rem;
+      .rule{
+        padding: .3rem .7rem;
         border-radius: 999px;
-        border: 1px solid rgba(17,24,39,.10);
-        background: rgba(255,214,10,.18);
+        border: 1px solid rgba(0,0,0,.10);
+        background: rgba(255,255,255,.9);
         color: rgba(17,24,39,.86);
         font-weight: 800;
         font-size: .78rem;
+        white-space: nowrap;
       }
 
-      /* Cards */
+      /* Sections */
       .card{
-        border-radius: 22px;
+        border-radius: 16px;
         padding: 1.05rem 1.05rem;
-        background: rgba(255,255,255,.70);
-        border: 1px solid rgba(17,24,39,.08);
-        box-shadow: 0 16px 46px rgba(15,23,42,.06);
-        backdrop-filter: blur(10px);
+        background: rgba(255,255,255,.86);
+        border: 1px solid rgba(0,0,0,.08);
+        box-shadow: 0 14px 42px rgba(0,0,0,.06);
+        backdrop-filter: blur(8px);
         margin-bottom: .9rem;
       }
       .h{
-        margin: 0 0 .65rem 0;
+        margin: 0 0 .7rem 0;
         font-size: 1.02rem;
         font-weight: 900;
         color: rgba(17,24,39,.92);
@@ -121,42 +96,35 @@ st.markdown(
       .muted{ color: rgba(17,24,39,.62); font-size: .92rem; }
       .tiny{ color: rgba(17,24,39,.52); font-size: .84rem; }
 
-      /* Cute pills */
+      /* Pills */
       .pills{display:flex; flex-wrap:wrap; gap:.55rem; margin-top:.15rem;}
       .pill{
-        display:flex; align-items:center; gap:.45rem;
-        padding: .38rem .62rem;
+        display:flex; align-items:center; gap:.5rem;
+        padding: .4rem .65rem;
         border-radius: 999px;
-        border: 1px solid rgba(17,24,39,.10);
-        background: rgba(255,255,255,.85);
-        box-shadow: 0 10px 24px rgba(0,0,0,.05);
-        font-weight: 850;
+        border: 1px solid rgba(0,0,0,.10);
+        background: rgba(255,255,255,.95);
+        box-shadow: 0 10px 22px rgba(0,0,0,.04);
+        font-weight: 800;
         font-size: .85rem;
         color: rgba(17,24,39,.86);
       }
       .dot{
-        width: 10px; height: 10px; border-radius: 50%;
-        background: linear-gradient(135deg, #FFD60A, #0B0B0F);
+        width: 9px; height: 9px; border-radius: 50%;
+        background: #111827;
+        opacity: .85;
       }
 
-      /* Inputs and buttons: rounded & clean */
+      /* Inputs */
       .stSelectbox div[data-baseweb="select"] > div,
       .stMultiSelect div[data-baseweb="select"] > div,
       .stFileUploader div{
-        border-radius: 16px !important;
+        border-radius: 14px !important;
       }
       .stDownloadButton button{
         border-radius: 999px !important;
         padding: .65rem 1.05rem !important;
         font-weight: 900 !important;
-      }
-
-      /* Remove heavy metric boxes look */
-      [data-testid="stMetric"]{
-        background: rgba(255,255,255,.0) !important;
-        border: none !important;
-        box-shadow: none !important;
-        padding: 0 !important;
       }
     </style>
     """,
@@ -164,23 +132,23 @@ st.markdown(
 )
 
 st.markdown(
-    f"""
-    <div class="nav">
+    """
+    <div class="topbar">
       <div class="brand">
-        <div class="logo"></div>
+        <div class="mark"></div>
         <div>
           <div class="title">Grouping Studio</div>
-          <div class="subtitle">Clean grouping for MAP + unit tests • Group 1 = highest</div>
+          <div class="subtitle">Upload → select scores → configure grouping → export roster</div>
         </div>
       </div>
-      <div class="tag">{APP_VERSION}</div>
+      <div class="rule">Group 1 = highest • MAP → percentile (0–100)</div>
     </div>
     """,
     unsafe_allow_html=True,
 )
 
 # -------------------------
-# Grade (grade-only) + show class count
+# Grade (grade-only)
 # -------------------------
 GRADE_CLASS_COUNT = {
     "JG1": 2,
@@ -192,7 +160,7 @@ GRADE_CLASS_COUNT = {
 }
 
 st.markdown("<div class='card'>", unsafe_allow_html=True)
-st.markdown("<div class='h'>🏫 Grade</div>", unsafe_allow_html=True)
+st.markdown("<div class='h'>Grade</div>", unsafe_allow_html=True)
 
 selected_grade = st.selectbox(
     "Grade",
@@ -201,7 +169,7 @@ selected_grade = st.selectbox(
     key="grade_main",
 )
 st.markdown(
-    f"<div class='muted'>This grade has <b>{GRADE_CLASS_COUNT[selected_grade]}</b> classes.</div>",
+    f"<div class='muted'>Classes in {selected_grade}: <b>{GRADE_CLASS_COUNT[selected_grade]}</b></div>",
     unsafe_allow_html=True,
 )
 st.markdown("</div>", unsafe_allow_html=True)
@@ -210,9 +178,9 @@ st.markdown("</div>", unsafe_allow_html=True)
 # Upload
 # -------------------------
 st.markdown("<div class='card'>", unsafe_allow_html=True)
-st.markdown("<div class='h'>📤 Upload</div>", unsafe_allow_html=True)
+st.markdown("<div class='h'>Upload</div>", unsafe_allow_html=True)
 uploaded_file = st.file_uploader("Upload CSV (UTF-8 recommended)", type=["csv"])
-st.markdown("<div class='tiny'>Excel → Save As → <b>CSV UTF-8</b> is recommended.</div>", unsafe_allow_html=True)
+st.markdown("<div class='tiny'>Excel → Save As → CSV UTF-8 recommended.</div>", unsafe_allow_html=True)
 st.markdown("</div>", unsafe_allow_html=True)
 
 if uploaded_file is None:
@@ -229,7 +197,6 @@ def norm(s: str) -> str:
 
 cols_norm = {c: norm(c) for c in work.columns}
 
-# student id
 student_id_col = None
 for c, n in cols_norm.items():
     if n in ["student_id", "student id", "id"]:
@@ -239,11 +206,9 @@ if student_id_col is None:
     work["student_id"] = [f"S{i+1:03d}" for i in range(len(work))]
     student_id_col = "student_id"
 
-# map
 map_candidates = [c for c, n in cols_norm.items() if ("map" in n and "math" in n)]
 map_col = map_candidates[0] if map_candidates else None
 
-# unit tests 1..10
 unit_pairs = []
 for c, n in cols_norm.items():
     m = re.search(r"math\s*unit\s*test\s*(\d+)", n)
@@ -260,17 +225,17 @@ if map_col is None and len(unit_test_cols) == 0:
 n_students = len(work)
 
 # -------------------------
-# Snapshot (cute pills)
+# Snapshot
 # -------------------------
 st.markdown("<div class='card'>", unsafe_allow_html=True)
-st.markdown("<div class='h'>✨ Snapshot</div>", unsafe_allow_html=True)
+st.markdown("<div class='h'>Snapshot</div>", unsafe_allow_html=True)
 st.markdown("<div class='pills'>", unsafe_allow_html=True)
 
 pills = [
-    f"👥 {n_students} students",
-    f"🗺️ MAP: {'Yes' if map_col else 'No'}",
-    f"🧪 Unit tests: {len(unit_test_cols)}",
-    f"🏫 {selected_grade} ({GRADE_CLASS_COUNT[selected_grade]} classes)",
+    f"{n_students} students",
+    f"MAP: {'Found' if map_col else 'Not found'}",
+    f"Unit tests detected: {len(unit_test_cols)}",
+    f"{selected_grade} ({GRADE_CLASS_COUNT[selected_grade]} classes)",
 ]
 for label in pills:
     st.markdown(f"<div class='pill'><span class='dot'></span>{label}</div>", unsafe_allow_html=True)
@@ -281,7 +246,7 @@ st.markdown("</div>", unsafe_allow_html=True)
 # -------------------------
 # Score selection (DEFAULT EMPTY)
 # Works with ONE score alone:
-# - If exactly one unit test selected => ignore MAP automatically
+# - If exactly one unit test is selected => ignore MAP automatically
 # -------------------------
 options = []
 if map_col is not None:
@@ -289,7 +254,7 @@ if map_col is not None:
 options += unit_test_cols
 
 st.markdown("<div class='card'>", unsafe_allow_html=True)
-st.markdown("<div class='h'>🧩 Choose scores</div>", unsafe_allow_html=True)
+st.markdown("<div class='h'>Select scores</div>", unsafe_allow_html=True)
 selected_score_cols = st.multiselect(
     "Start empty — select 1 or more score columns",
     options=options,
@@ -316,11 +281,11 @@ if only_one_selected and (selected_only != map_col):
 # Controls (k default = 0)
 # -------------------------
 st.markdown("<div class='card'>", unsafe_allow_html=True)
-st.markdown("<div class='h'>🎚️ Group rules</div>", unsafe_allow_html=True)
+st.markdown("<div class='h'>Grouping settings</div>", unsafe_allow_html=True)
 
 c1, c2, c3 = st.columns([1, 1, 1])
 with c1:
-    k = st.slider("Groups (choose 1–10)", 0, 10, 0)
+    k = st.slider("Number of groups (1–10)", 0, 10, 0)
 with c2:
     cap_pct = st.slider("Max group size (% of class)", 0, 40, 0, help="0% = no limit")
 with c3:
@@ -335,6 +300,7 @@ st.markdown("</div>", unsafe_allow_html=True)
 if k == 0:
     st.info("Choose how many groups (1–10) to continue.")
     st.stop()
+
 if k > n_students:
     st.error(f"Groups ({k}) cannot be greater than students ({n_students}).")
     st.stop()
@@ -369,7 +335,9 @@ else:
     weights = np.ones(len(model_features), dtype=float)
 weights = weights / weights.sum()
 
+# -------------------------
 # Preprocess + KMeans
+# -------------------------
 X_raw = work[model_features].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
 X_imputed = SimpleImputer(strategy="mean").fit_transform(X_raw)
 Z = StandardScaler().fit_transform(X_imputed)
@@ -444,11 +412,10 @@ else:
     work["UnitTests_influence_%"] = 100.0
 
 # -------------------------
-# Results (no big metric boxes)
+# Results
 # -------------------------
 st.markdown("<div class='card'>", unsafe_allow_html=True)
-st.markdown("<div class='h'>🧾 Results</div>", unsafe_allow_html=True)
-
+st.markdown("<div class='h'>Results</div>", unsafe_allow_html=True)
 st.markdown(
     f"<div class='muted'><b>Groups:</b> {k} &nbsp;&nbsp; "
     f"<b>Selected scores:</b> {len(selected_score_cols)} &nbsp;&nbsp; "
@@ -468,14 +435,14 @@ st.markdown("</div>", unsafe_allow_html=True)
 
 # Group sizes
 st.markdown("<div class='card'>", unsafe_allow_html=True)
-st.markdown("<div class='h'>📌 Group sizes</div>", unsafe_allow_html=True)
+st.markdown("<div class='h'>Group sizes</div>", unsafe_allow_html=True)
 sizes = work.groupby("Group Name").size().reset_index(name="students")
 st.dataframe(sizes.sort_values("Group Name"), use_container_width=True)
 st.markdown("</div>", unsafe_allow_html=True)
 
 # Export
 st.markdown("<div class='card'>", unsafe_allow_html=True)
-st.markdown("<div class='h'>⬇️ Export</div>", unsafe_allow_html=True)
+st.markdown("<div class='h'>Export</div>", unsafe_allow_html=True)
 download_df = work[show_cols].copy()
 st.download_button(
     "Download CSV",

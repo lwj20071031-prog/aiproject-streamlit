@@ -15,24 +15,20 @@ st.set_page_config(page_title="Grouping Studio", layout="wide")
 st.markdown(
     """
     <style>
-      /* Hide Streamlit chrome */
       #MainMenu {visibility: hidden;}
       footer {visibility: hidden;}
       header {visibility: hidden;}
 
-      /* Professional neutral background */
       .stApp{
         background: linear-gradient(180deg, #FAFAFA 0%, #F5F5F7 100%);
       }
 
-      /* Layout */
       .block-container{
         padding-top: 1.1rem;
         padding-bottom: 2.2rem;
         max-width: 1180px;
       }
 
-      /* Top bar */
       .topbar{
         display:flex;
         align-items:center;
@@ -40,7 +36,7 @@ st.markdown(
         gap:1rem;
         padding: 0.95rem 1.05rem;
         border-radius: 16px;
-        background: rgba(255,255,255,.85);
+        background: rgba(255,255,255,.88);
         border: 1px solid rgba(0,0,0,.08);
         box-shadow: 0 14px 40px rgba(0,0,0,.07);
         backdrop-filter: blur(10px);
@@ -70,18 +66,17 @@ st.markdown(
         padding: .3rem .7rem;
         border-radius: 999px;
         border: 1px solid rgba(0,0,0,.10);
-        background: rgba(255,255,255,.9);
+        background: rgba(255,255,255,.92);
         color: rgba(17,24,39,.86);
         font-weight: 800;
         font-size: .78rem;
         white-space: nowrap;
       }
 
-      /* Sections */
       .card{
         border-radius: 16px;
         padding: 1.05rem 1.05rem;
-        background: rgba(255,255,255,.86);
+        background: rgba(255,255,255,.88);
         border: 1px solid rgba(0,0,0,.08);
         box-shadow: 0 14px 42px rgba(0,0,0,.06);
         backdrop-filter: blur(8px);
@@ -96,26 +91,6 @@ st.markdown(
       .muted{ color: rgba(17,24,39,.62); font-size: .92rem; }
       .tiny{ color: rgba(17,24,39,.52); font-size: .84rem; }
 
-      /* Pills */
-      .pills{display:flex; flex-wrap:wrap; gap:.55rem; margin-top:.15rem;}
-      .pill{
-        display:flex; align-items:center; gap:.5rem;
-        padding: .4rem .65rem;
-        border-radius: 999px;
-        border: 1px solid rgba(0,0,0,.10);
-        background: rgba(255,255,255,.95);
-        box-shadow: 0 10px 22px rgba(0,0,0,.04);
-        font-weight: 800;
-        font-size: .85rem;
-        color: rgba(17,24,39,.86);
-      }
-      .dot{
-        width: 9px; height: 9px; border-radius: 50%;
-        background: #111827;
-        opacity: .85;
-      }
-
-      /* Inputs */
       .stSelectbox div[data-baseweb="select"] > div,
       .stMultiSelect div[data-baseweb="select"] > div,
       .stFileUploader div{
@@ -225,25 +200,6 @@ if map_col is None and len(unit_test_cols) == 0:
 n_students = len(work)
 
 # -------------------------
-# Snapshot
-# -------------------------
-st.markdown("<div class='card'>", unsafe_allow_html=True)
-st.markdown("<div class='h'>Snapshot</div>", unsafe_allow_html=True)
-st.markdown("<div class='pills'>", unsafe_allow_html=True)
-
-pills = [
-    f"{n_students} students",
-    f"MAP: {'Found' if map_col else 'Not found'}",
-    f"Unit tests detected: {len(unit_test_cols)}",
-    f"{selected_grade} ({GRADE_CLASS_COUNT[selected_grade]} classes)",
-]
-for label in pills:
-    st.markdown(f"<div class='pill'><span class='dot'></span>{label}</div>", unsafe_allow_html=True)
-
-st.markdown("</div>", unsafe_allow_html=True)
-st.markdown("</div>", unsafe_allow_html=True)
-
-# -------------------------
 # Score selection (DEFAULT EMPTY)
 # Works with ONE score alone:
 # - If exactly one unit test is selected => ignore MAP automatically
@@ -279,15 +235,22 @@ if only_one_selected and (selected_only != map_col):
 
 # -------------------------
 # Controls (k default = 0)
+# Cap slider removed; replaced with optional toggle
 # -------------------------
 st.markdown("<div class='card'>", unsafe_allow_html=True)
 st.markdown("<div class='h'>Grouping settings</div>", unsafe_allow_html=True)
 
 c1, c2, c3 = st.columns([1, 1, 1])
+
 with c1:
     k = st.slider("Number of groups (1–10)", 0, 10, 0)
+
 with c2:
-    cap_pct = st.slider("Max group size (% of class)", 0, 40, 0, help="0% = no limit")
+    limit_group_size = st.checkbox("Limit max group size", value=False)
+    cap_pct = 0
+    if limit_group_size:
+        cap_pct = st.slider("Max % per group", 1, 40, 20)
+
 with c3:
     if use_map and len(selected_unit_tests) > 0:
         map_weight_pct = st.slider("MAP weight (%)", 0, 100, 0)
@@ -358,7 +321,7 @@ else:
     if k * cap < n_students:
         st.error(
             f"Impossible: {k} groups × max {cap}/group = {k*cap}, but class size is {n_students}. "
-            f"Increase cap % or increase groups."
+            f"Increase cap % or disable the limit."
         )
         st.stop()
 
@@ -374,7 +337,7 @@ else:
                 break
 
     if np.any(assigned == -1):
-        st.error("Assignment failed unexpectedly. Try increasing cap %.")
+        st.error("Assignment failed unexpectedly. Try disabling the limit or increasing max %.")
         st.stop()
 
 work["_cluster_internal"] = assigned  # never shown

@@ -172,6 +172,7 @@ def norm(s: str) -> str:
 
 cols_norm = {c: norm(c) for c in work.columns}
 
+# student id
 student_id_col = None
 for c, n in cols_norm.items():
     if n in ["student_id", "student id", "id"]:
@@ -181,9 +182,11 @@ if student_id_col is None:
     work["student_id"] = [f"S{i+1:03d}" for i in range(len(work))]
     student_id_col = "student_id"
 
+# MAP column (math)
 map_candidates = [c for c, n in cols_norm.items() if ("map" in n and "math" in n)]
 map_col = map_candidates[0] if map_candidates else None
 
+# unit tests 1..10
 unit_pairs = []
 for c, n in cols_norm.items():
     m = re.search(r"math\s*unit\s*test\s*(\d+)", n)
@@ -201,7 +204,7 @@ n_students = len(work)
 
 # -------------------------
 # Score selection (DEFAULT EMPTY)
-# Works with ONE score alone:
+# 1-score mode still works:
 # - If exactly one unit test is selected => ignore MAP automatically
 # -------------------------
 options = []
@@ -229,6 +232,7 @@ selected_only = selected_score_cols[0] if only_one_selected else None
 use_map = (map_col is not None and map_col in selected_score_cols)
 selected_unit_tests = [c for c in selected_score_cols if c != map_col]
 
+# 1-test mode: if only one selected and it's NOT MAP -> force MAP off
 if only_one_selected and (selected_only != map_col):
     use_map = False
     selected_unit_tests = [selected_only]
@@ -236,6 +240,7 @@ if only_one_selected and (selected_only != map_col):
 # -------------------------
 # Controls (k default = 0)
 # Cap slider removed; replaced with optional toggle
+# MAP weight slider ALWAYS visible (disabled unless MAP+unit selected)
 # -------------------------
 st.markdown("<div class='card'>", unsafe_allow_html=True)
 st.markdown("<div class='h'>Grouping settings</div>", unsafe_allow_html=True)
@@ -252,11 +257,16 @@ with c2:
         cap_pct = st.slider("Max % per group", 1, 40, 20)
 
 with c3:
-    if use_map and len(selected_unit_tests) > 0:
-        map_weight_pct = st.slider("MAP weight (%)", 0, 100, 0)
-    else:
-        map_weight_pct = 0
-        st.caption("MAP weight appears only when MAP + unit tests are selected.")
+    # Always show, but disable unless MAP + at least 1 unit test selected
+    enable_map_weight = bool(use_map and len(selected_unit_tests) > 0)
+    map_weight_pct = st.slider(
+        "MAP weight (%)",
+        0, 100, 0,
+        disabled=(not enable_map_weight),
+        key="map_weight_pct",
+    )
+    if not enable_map_weight:
+        st.caption("Select MAP + at least one unit test to enable weighting.")
 
 st.markdown("</div>", unsafe_allow_html=True)
 
@@ -288,7 +298,9 @@ if len(model_features) < 1:
     st.error("No usable numeric features found.")
     st.stop()
 
+# -------------------------
 # Weights
+# -------------------------
 if use_map and len(selected_unit_tests) > 0:
     map_w = map_weight_pct / 100.0
     remaining = 1.0 - map_w
@@ -355,7 +367,6 @@ order_best = (
 )
 cluster_to_groupnum = {cl: i + 1 for i, cl in enumerate(order_best)}
 work["Group"] = work["_cluster_internal"].map(cluster_to_groupnum).astype(int)
-
 work["Group Name"] = work["Group"].apply(lambda g: f"{selected_grade} • Group {g}")
 
 # Influence (MAP vs Unit tests)

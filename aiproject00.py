@@ -8,6 +8,35 @@ from sklearn.cluster import KMeans
 
 
 # -------------------------
+# Style (make Remove button match uploader height)
+# NOTE: This styles ALL Streamlit buttons to the same height as the uploader box.
+# -------------------------
+st.markdown(
+    """
+<style>
+/* Make the upload dropzone a fixed height */
+div[data-testid="stFileUploader"] section {
+  min-height: 120px !important;
+}
+div[data-testid="stFileUploaderDropzone"] {
+  min-height: 120px !important;
+  padding-top: 18px !important;
+  padding-bottom: 18px !important;
+}
+
+/* Make ALL buttons match that height (incl. Remove file + Download) */
+div[data-testid="stButton"] > button,
+div[data-testid="stDownloadButton"] > button {
+  min-height: 120px !important;
+  border-radius: 12px !important;
+}
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+
+# -------------------------
 # Helpers
 # -------------------------
 def _reset_widget_keys(keys: list[str]) -> None:
@@ -93,7 +122,9 @@ def to_0_100(x: np.ndarray) -> np.ndarray:
 
 
 # -------------------------
-# Core compute
+# Core compute (BLANKS DO NOT COUNT AT ALL)
+# - Any student with ANY blank among selected score columns is EXCLUDED from everything:
+#   grouping, cap %, overall score, output table.
 # -------------------------
 def compute_groups(
     df: pd.DataFrame,
@@ -106,11 +137,11 @@ def compute_groups(
     work = df.copy()
     feature_keys = list(selected_score_cols)
 
-    # numeric conversion
+    # numeric conversion: blanks -> NaN
     for c in feature_keys:
         work[c] = pd.to_numeric(work[c], errors="coerce")
 
-    # Drop rows missing any selected feature (no imputation)
+    # Exclude any row with ANY missing selected score (no imputation)
     X = work[feature_keys].to_numpy(dtype=float)
     valid_mask = ~np.any(np.isnan(X), axis=1)
 
@@ -136,7 +167,7 @@ def compute_groups(
         {"score": feature_keys, "final_weight_%": np.round(weights * 100.0, 2)}
     )
 
-    # Standardize
+    # Standardize (valid-only)
     X_valid = valid_work[feature_keys].to_numpy(dtype=float)
     Z = StandardScaler().fit_transform(X_valid)
 
@@ -159,19 +190,17 @@ def compute_groups(
 
         # minimum cap needed to fit everyone
         min_cap = int(np.ceil(n_valid / k))
-
         if cap < min_cap:
             cap = min_cap
             cap_adjust_note = (
-                f"Max % per group was too small to fit all students. "
-                f"Auto-adjusted to at least {int(np.ceil(100 * cap / n_valid))}% "
-                f"(min {cap} students per group for {n_valid} students / {k} groups)."
+                f"Max % per group was too small to fit all valid students. "
+                f"Auto-adjusted to at least {int(np.ceil(100 * cap / n_valid))}%."
             )
 
-        # assignment with cap
+        # cap assignment
         sorted_d = np.sort(dists, axis=1)
         margin = sorted_d[:, 1] - sorted_d[:, 0]
-        sorted_idx = np.argsort(-margin)  # easiest first
+        sorted_idx = np.argsort(-margin)
 
         remaining = np.array([cap] * k, dtype=int)
         assigned = np.full(n_valid, -1, dtype=int)
@@ -202,8 +231,9 @@ def compute_groups(
         .tolist()
     )
     cluster_to_groupnum = {cl: i + 1 for i, cl in enumerate(order_best)}
-
     valid_work["Group"] = valid_work["_cluster_internal"].map(cluster_to_groupnum).astype(int)
+
+    # Group name WITHOUT grade
     valid_work["Group Name"] = valid_work["Group"].apply(lambda g: f"Group {g}")
 
     return valid_work, excluded, weights_view, cap_adjust_note
@@ -215,13 +245,13 @@ def compute_groups(
 st.set_page_config(page_title="WAB Classroom Assignment Program", layout="wide")
 st.title("WAB Classroom Assignment Program")
 
-# Upload / remove file
+# Upload / remove file (button aligned beside uploader)
 if "uploader_key" not in st.session_state:
     st.session_state["uploader_key"] = 0
 if "current_file_sig" not in st.session_state:
     st.session_state["current_file_sig"] = None
 
-c1, c2 = st.columns([3, 1])
+c1, c2 = st.columns([4, 1], vertical_alignment="top")
 with c1:
     uploaded = st.file_uploader(
         "Upload CSV (UTF-8 recommended)",
@@ -273,9 +303,10 @@ try:
                     f"Column out of range: {index_to_excel_col(i)} (file has {len(df_work.columns)} columns)"
                 )
         selected_score_cols = [df_work.columns[i] for i in idxs]
+
         st.dataframe(
             pd.DataFrame({"Excel": [index_to_excel_col(i) for i in idxs], "Column title": selected_score_cols}),
-            use_container_width=True,
+            width="stretch",
             height=210,
         )
 except Exception as e:
@@ -292,13 +323,13 @@ weights_key = f"weights_0to10_{abs(hash(tuple(selected_score_cols))) % 10**9}"
 
 if len(selected_score_cols) == 1:
     weights_0to10 = np.array([10], dtype=int)
-    st.dataframe(pd.DataFrame({"score": selected_score_cols, "weight_0_to_10": [10]}), use_container_width=True)
+    st.dataframe(pd.DataFrame({"score": selected_score_cols, "weight_0_to_10": [10]}), width="stretch")
 else:
     default_df = pd.DataFrame({"score": selected_score_cols, "weight_0_to_10": [10] * len(selected_score_cols)})
     w_df = st.data_editor(
         default_df,
         key=weights_key,
-        use_container_width=True,
+        width="stretch",
         num_rows="fixed",
         column_config={
             "score": st.column_config.TextColumn("Score", disabled=True),
@@ -330,7 +361,7 @@ if cap_note:
     st.warning(cap_note)
 
 st.subheader("Weights used")
-st.dataframe(weights_view, use_container_width=True)
+st.dataframe(weights_view, width="stretch")
 
 st.subheader("Results")
 show_cols = ["Overall Score", student_id_col, "Group Name"] + selected_score_cols
@@ -339,11 +370,7 @@ out_table = (
     .sort_values(["Overall Score", "Group Name", student_id_col], ascending=[False, True, True])
     .reset_index(drop=True)
 )
-st.dataframe(out_table, use_container_width=True, height=560)
-
-if len(excluded) > 0:
-    st.subheader("Excluded (missing selected scores)")
-    st.dataframe(excluded.reset_index(drop=True), use_container_width=True, height=240)
+st.dataframe(out_table, width="stretch", height=560)
 
 st.subheader("Export")
 st.download_button(

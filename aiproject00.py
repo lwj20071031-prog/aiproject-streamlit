@@ -3,16 +3,10 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 
-from sklearn.preprocessing import StandardScaler
-
 
 # -------------------------
-# Helpers
+# Helpers: Excel letters
 # -------------------------
-def norm(s: str) -> str:
-    return re.sub(r"\s+", " ", str(s).strip().lower())
-
-
 def index_to_excel_col(i: int) -> str:
     n = i + 1
     out = ""
@@ -66,11 +60,6 @@ def parse_excel_letters_input(text: str) -> list[int]:
     return indices
 
 
-@st.cache_data(show_spinner=False)
-def read_csv_cached(file_bytes: bytes) -> pd.DataFrame:
-    return pd.read_csv(pd.io.common.BytesIO(file_bytes))
-
-
 def to_0_100(x: np.ndarray) -> np.ndarray:
     x = x.astype(float)
     mn = np.nanmin(x)
@@ -80,12 +69,123 @@ def to_0_100(x: np.ndarray) -> np.ndarray:
     return (x - mn) / (mx - mn) * 100.0
 
 
+# -------------------------
+# Robust CSV reader (AUTO header detection + drop empty columns)
+# -------------------------
+def _clean_columns(df: pd.DataFrame) -> pd.DataFrame:
+    # Strip column names
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+
+    # Drop columns that are completely empty (all NaN) OR are Unnamed and empty
+    # This fixes "tons of trailing commas" exports.
+    all_nan_cols = [c for c in df.columns if df[c].isna().all()]
+    df = df.drop(columns=all_nan_cols, errors="ignore")
+
+    # Drop columns that are "Unnamed: x" AND have no real data
+    unnamed = [c for c in df.columns if str(c).strip().lower().startswith("unnamed")]
+    drop_unnamed = []
+    for c in unnamed:
+        s = df[c]
+        # if all values are NA or empty strings -> drop
+        if s.isna().all() or (s.astype(str).str.strip().replace("nan", "").eq("").all()):
+            drop_unnamed.append(c)
+    df = df.drop(columns=drop_unnamed, errors="ignore")
+    return df
+
+
+def _header_score(row: list[str]) -> float:
+    """
+    Score how 'header-like' a row is.
+    Higher = more likely to be a real header.
+    """
+    cells = [("" if x is None else str(x).strip()) for x in row]
+    nonempty = [c for c in cells if c != "" and c.lower() != "nan"]
+    if len(nonempty) == 0:
+        return -1.0
+
+    uniq = len(set([c.lower() for c in nonempty]))
+    # prefer rows with many non-empty + many unique tokens
+    score = len(nonempty) + 0.5 * uniq
+
+    # penalize rows that look like "Demographics", "MAP..." spanning titles (few unique repeated)
+    if uniq <= 2 and len(nonempty) >= 5:
+        score -= 2.0
+
+    # penalize rows that are mostly numbers (headers usually text)
+    numeric_like = 0
+    for c in nonempty:
+        if re.fullmatch(r"[-+]?\d+(\.\d+)?", c):
+            numeric_like += 1
+    if numeric_like / max(len(nonempty), 1) > 0.6:
+        score -= 2.0
+
+    return score
+
+
+@st.cache_data(show_spinner=False)
+def read_csv_smart(file_bytes: bytes) -> tuple[pd.DataFrame, int]:
+    """
+    1) read first N rows without header, find most header-like row index
+    2) read full CSV using that row as header
+    3) drop empty/trailing columns
+    Returns (df, header_row_index)
+    """
+    # Try utf-8-sig first (Excel often adds BOM)
+    # Read small preview with header=None to detect header row
+    preview = None
+    for enc in ("utf-8-sig", "utf-8", "cp949", "latin1"):
+        try:
+            preview = pd.read_csv(
+                pd.io.common.BytesIO(file_bytes),
+                header=None,
+                nrows=40,
+                dtype=str,
+                encoding=enc,
+                engine="python",
+            )
+            used_enc = enc
+            break
+        except Exception:
+            continue
+
+    if preview is None:
+        # last resort
+        preview = pd.read_csv(
+            pd.io.common.BytesIO(file_bytes),
+            header=None,
+            nrows=40,
+            dtype=str,
+            engine="python",
+        )
+        used_enc = "utf-8"
+
+    # choose best header row among first 40 rows
+    best_i = 0
+    best_score = -1e9
+    for i in range(len(preview)):
+        row = preview.iloc[i].tolist()
+        sc = _header_score(row)
+        if sc > best_score:
+            best_score = sc
+            best_i = i
+
+    # read full with detected header row
+    df = pd.read_csv(
+        pd.io.common.BytesIO(file_bytes),
+        header=best_i,
+        encoding=used_enc,
+        engine="python",
+    )
+
+    df = _clean_columns(df)
+    return df, best_i
+
+
+# -------------------------
+# Partial-score standardize + masked kmeans
+# -------------------------
 def standardize_with_nans(X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Standardize each column using mean/std computed on available values only.
-    NaNs remain NaN.
-    Returns Z (standardized) and mask (True where value exists).
-    """
     mask = ~np.isnan(X)
     Z = X.astype(float).copy()
 
@@ -98,7 +198,6 @@ def standardize_with_nans(X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         mean = np.mean(col[m])
         std = np.std(col[m])
         if std == 0 or not np.isfinite(std):
-            # if no variance, set standardized values to 0 where present
             Z[m, j] = 0.0
             Z[~m, j] = np.nan
         else:
@@ -109,13 +208,6 @@ def standardize_with_nans(X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
 
 def masked_weighted_dist2(Z: np.ndarray, mask: np.ndarray, C: np.ndarray, w: np.ndarray) -> np.ndarray:
-    """
-    Compute squared distances from each row in Z to each centroid in C
-    using only present features per row. Missing features are completely ignored.
-
-    dist2[i, g] = sum_j w_j * (Z_ij - C_gj)^2 over present j / sum_j w_j over present j
-    If a row has no present weighted features -> dist2 = +inf
-    """
     n, d = Z.shape
     k = C.shape[0]
     dist2 = np.full((n, k), np.inf, dtype=float)
@@ -124,31 +216,24 @@ def masked_weighted_dist2(Z: np.ndarray, mask: np.ndarray, C: np.ndarray, w: np.
     w = np.clip(w, 0.0, None)
 
     for i in range(n):
-        m = mask[i]  # present
+        m = mask[i]
         wsum = float(np.sum(w[m]))
         if wsum <= 0:
             continue
-        zi = Z[i]
-        # compute for each centroid
         for g in range(k):
-            diff = zi[m] - C[g, m]
+            diff = Z[i, m] - C[g, m]
             dist2[i, g] = float(np.sum(w[m] * (diff ** 2)) / wsum)
 
     return dist2
 
 
 def masked_kmeans(Z: np.ndarray, mask: np.ndarray, weights: np.ndarray, k: int, max_iter: int = 40, seed: int = 0):
-    """
-    Custom KMeans that ignores missing features per student (completely neglected).
-    """
     rng = np.random.default_rng(seed)
     n, d = Z.shape
 
-    # init centroids: pick random rows; missing dims init to 0
     init_idx = rng.choice(n, size=k, replace=(n < k))
     C = np.zeros((k, d), dtype=float)
     for g, idx in enumerate(init_idx):
-        C[g, :] = 0.0
         m = mask[idx]
         C[g, m] = Z[idx, m]
 
@@ -162,11 +247,9 @@ def masked_kmeans(Z: np.ndarray, mask: np.ndarray, weights: np.ndarray, k: int, 
             break
         labels = new_labels
 
-        # update centroids: mean of available z-values per feature inside cluster
         for g in range(k):
             idxs = np.where(labels == g)[0]
             if len(idxs) == 0:
-                # re-seed empty cluster
                 ridx = rng.integers(0, n)
                 C[g, :] = 0.0
                 m = mask[ridx]
@@ -183,22 +266,10 @@ def masked_kmeans(Z: np.ndarray, mask: np.ndarray, weights: np.ndarray, k: int, 
     return labels, C
 
 
-# -------------------------
-# Core compute (PARTIAL SCORES ALLOWED)
-# - If a score is blank for a student, that score is COMPLETELY IGNORED for that student.
-# - Only students with ALL selected scores blank are excluded.
-# -------------------------
-def compute_groups_partial(
-    df: pd.DataFrame,
-    id_col: str,
-    selected_score_cols: list[str],
-    k: int,
-    cap_pct: int,
-    weights_0to10: np.ndarray,
-):
+def compute_groups_partial(df, id_col, selected_score_cols, k, cap_pct, weights_0to10):
     work = df.copy()
 
-    # numeric conversion: blanks -> NaN
+    # convert selected score cols to numeric (blanks->NaN)
     for c in selected_score_cols:
         work[c] = pd.to_numeric(work[c], errors="coerce")
 
@@ -210,8 +281,7 @@ def compute_groups_partial(
         raise ValueError("Weights do not match the selected score columns.")
     raw = np.clip(raw, 0.0, None)
 
-    # Exclude students who have ZERO usable weighted scores
-    usable_w = (raw > 0).astype(bool)
+    usable_w = (raw > 0)
     row_has_any = np.any(mask[:, usable_w], axis=1) if np.any(usable_w) else np.zeros(len(work), dtype=bool)
 
     excluded = work.loc[~row_has_any, [id_col] + selected_score_cols].copy()
@@ -223,22 +293,15 @@ def compute_groups_partial(
 
     if n_valid == 0:
         raise ValueError("No students have any usable scores (all selected scores are blank or weights are 0).")
-
     if k > n_valid:
         raise ValueError(f"Number of groups ({k}) cannot exceed valid students ({n_valid}).")
-
     if raw.sum() <= 0:
         raise ValueError("All weights are 0. Set at least one weight above 0.")
 
     weights = (raw / raw.sum()).astype(float)
-    weights_view = pd.DataFrame(
-        {"score": selected_score_cols, "final_weight_%": np.round(weights * 100.0, 2)}
-    )
+    weights_view = pd.DataFrame({"score": selected_score_cols, "final_weight_%": np.round(weights * 100.0, 2)})
 
-    # --- masked kmeans (missing values are ignored per student)
     labels, C = masked_kmeans(Z_valid, mask_valid, weights, k=k, max_iter=50, seed=0)
-
-    # distances for optional cap assignment
     dist2 = masked_weighted_dist2(Z_valid, mask_valid, C, weights)
     dists = np.sqrt(np.maximum(dist2, 0.0))
 
@@ -277,8 +340,7 @@ def compute_groups_partial(
 
     valid_work["_cluster_internal"] = assigned
 
-    # --- Overall Score: weighted average of available standardized features per student
-    # Missing features are ignored by renormalizing weights per row.
+    # Overall Score: weighted average over available features per student (renormalize weights per row)
     overall_proxy = np.zeros(n_valid, dtype=float)
     for i in range(n_valid):
         m = mask_valid[i] & (weights > 0)
@@ -292,7 +354,7 @@ def compute_groups_partial(
     valid_work["_level_proxy"] = overall_proxy
     valid_work["Overall Score"] = np.round(to_0_100(overall_proxy), 2)
 
-    # Group 1 = best cluster (highest mean proxy)
+    # Group 1 = best cluster
     order_best = (
         valid_work.groupby("_cluster_internal")["_level_proxy"]
         .mean()
@@ -318,73 +380,78 @@ if uploaded is None:
     st.info("Upload a CSV file to begin.")
     st.stop()
 
-df = read_csv_cached(uploaded.getvalue())
-df_work = df.copy()
+file_bytes = uploaded.getvalue()
+file_sig = (len(file_bytes), hash(file_bytes[:5000]))  # lightweight signature
 
-# Student name column (Excel letter)
+# Reset widgets when file changes (prevents showing previous clicked data)
+if st.session_state.get("_file_sig") != file_sig:
+    st.session_state["_file_sig"] = file_sig
+    for k in list(st.session_state.keys()):
+        if k.startswith(("id_letters_input", "selected_letters_input", "k_groups", "limit_group_size", "cap_pct", "weights_0to10_")):
+            st.session_state.pop(k, None)
+
+df, detected_header_row = read_csv_smart(file_bytes)
+
+# (Optional) show detected header row in an expander (hidden by default)
+with st.expander("Header detection (advanced)"):
+    st.write(f"Detected header row index (0-based): {detected_header_row}")
+
+# Student name column
 st.subheader("Student name column (Excel letter)")
 st.caption("Type ONE Excel letter for the student name column. Example: A  OR  AB")
-
 id_letters = st.text_input("Student name column", value="", key="id_letters_input")
 
-id_col = None
 if id_letters.strip():
     idxs = parse_excel_letters_input(id_letters)
     if len(idxs) != 1:
         st.error("Please type exactly ONE column letter for the student name column (example: A or AB).")
         st.stop()
     idx = idxs[0]
-    if idx < 0 or idx >= len(df_work.columns):
-        st.error(f"Column out of range: {index_to_excel_col(idx)} (file has {len(df_work.columns)} columns)")
+    if idx < 0 or idx >= len(df.columns):
+        st.error(f"Column out of range: {index_to_excel_col(idx)} (file has {len(df.columns)} columns)")
         st.stop()
-    id_col = df_work.columns[idx]
+    id_col = df.columns[idx]
     st.dataframe(
         pd.DataFrame({"Excel": [index_to_excel_col(idx)], "Column title": [id_col]}),
         width="stretch",
         height=110,
     )
 else:
-    # fallback: try common names; if none, create student_id
-    cols_norm = {c: norm(c) for c in df_work.columns}
-    id_col = next(
-        (c for c, n in cols_norm.items() if n in ["student_id", "student id", "id", "name", "student name"]),
-        None,
-    )
+    # fallback: try common names; if none, create student_id silently
+    cols = [str(c).strip() for c in df.columns]
+    lowered = [c.lower() for c in cols]
+    id_col = None
+    for cand in ["student_id", "student id", "id", "name", "student name", "student number"]:
+        if cand in lowered:
+            id_col = df.columns[lowered.index(cand)]
+            break
     if id_col is None:
-        df_work["student_id"] = [f"S{i+1:03d}" for i in range(len(df_work))]
+        df = df.copy()
+        df["student_id"] = [f"S{i+1:03d}" for i in range(len(df))]
         id_col = "student_id"
-        st.info("No student name column selected — created a 'student_id' column automatically.")
 
-# Scores selection (Excel letters)
+# Score columns selection
 st.subheader("Select score columns (Excel letters)")
 st.caption("Examples: A, B, C  OR  A B C")
-
-letters_text = st.text_input(
-    "Type Excel letters for the score columns to include",
-    value="",
-    key="selected_letters_input",
-)
+letters_text = st.text_input("Type Excel letters for the score columns to include", value="", key="selected_letters_input")
 
 selected_score_cols: list[str] = []
 try:
     idxs = parse_excel_letters_input(letters_text)
     if idxs:
-        max_idx = len(df_work.columns) - 1
+        max_idx = len(df.columns) - 1
         for i in idxs:
             if i < 0 or i > max_idx:
-                raise ValueError(
-                    f"Column out of range: {index_to_excel_col(i)} (file has {len(df_work.columns)} columns)"
-                )
-        selected_score_cols = [df_work.columns[i] for i in idxs]
+                raise ValueError(f"Column out of range: {index_to_excel_col(i)} (file has {len(df.columns)} columns)")
+        selected_score_cols = [df.columns[i] for i in idxs]
 
-        # prevent ID col as score col
         if id_col in selected_score_cols:
             selected_score_cols = [c for c in selected_score_cols if c != id_col]
             st.warning("You included the student name column in the score list — it was removed automatically.")
 
         st.dataframe(
             pd.DataFrame(
-                {"Excel": [index_to_excel_col(i) for i in idxs], "Column title": [df_work.columns[i] for i in idxs]}
+                {"Excel": [index_to_excel_col(i) for i in idxs], "Column title": [df.columns[i] for i in idxs]}
             ),
             width="stretch",
             height=210,
@@ -399,7 +466,6 @@ if not selected_score_cols:
 # Weights per selected score
 st.subheader("Weights (0–10 per selected score)")
 st.caption("0 = off • 10 = strongest (normalized automatically)")
-
 weights_key = f"weights_0to10_{abs(hash(tuple(selected_score_cols))) % 10**9}"
 
 if len(selected_score_cols) == 1:
@@ -423,7 +489,7 @@ else:
     )
     weights_0to10 = pd.to_numeric(w_df["weight_0_to_10"], errors="coerce").fillna(0).to_numpy(dtype=int)
 
-# Grouping
+# Grouping settings
 st.subheader("Grouping settings")
 k = st.slider("Number of groups (1–10)", 1, 10, 3, key="k_groups")
 limit_group_size = st.checkbox("Limit max group size", value=False, key="limit_group_size")
@@ -432,7 +498,7 @@ cap_pct = st.slider("Max % per group", 1, 40, 20, key="cap_pct") if limit_group_
 try:
     with st.spinner("Recalculating…"):
         valid_work, excluded, weights_view, cap_note = compute_groups_partial(
-            df=df_work,
+            df=df,
             id_col=id_col,
             selected_score_cols=selected_score_cols,
             k=k,
@@ -458,7 +524,6 @@ out_table = (
 )
 st.dataframe(out_table, width="stretch", height=560)
 
-# Optional: show excluded only if any
 if len(excluded) > 0:
     with st.expander(f"Students excluded (no usable selected scores): {len(excluded)}"):
         st.dataframe(excluded.reset_index(drop=True), width="stretch", height=240)

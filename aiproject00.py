@@ -8,13 +8,19 @@ from sklearn.cluster import KMeans
 
 
 # -------------------------
-# Style (make Remove button match uploader height)
-# NOTE: This styles ALL Streamlit buttons to the same height as the uploader box.
+# Style: uploader + remove button alignment
+# - Hide uploader label and use one shared label above both
+# - Force dropzone and Remove button to share the same min-height
 # -------------------------
 st.markdown(
     """
 <style>
-/* Make the upload dropzone a fixed height */
+/* Shared "Upload" row visuals */
+div[data-testid="stFileUploader"] {
+  margin-top: 0px !important;
+}
+
+/* Dropzone fixed height */
 div[data-testid="stFileUploader"] section {
   min-height: 120px !important;
 }
@@ -22,13 +28,27 @@ div[data-testid="stFileUploaderDropzone"] {
   min-height: 120px !important;
   padding-top: 18px !important;
   padding-bottom: 18px !important;
+  border-radius: 12px !important;
 }
 
-/* Make ALL buttons match that height (incl. Remove file + Download) */
-div[data-testid="stButton"] > button,
-div[data-testid="stDownloadButton"] > button {
+/* Make the Remove button container stretch and match height */
+div[data-testid="stButton"] {
+  height: 100% !important;
+  display: flex !important;
+}
+div[data-testid="stButton"] > div {
+  width: 100% !important;
+  display: flex !important;
+}
+div[data-testid="stButton"] > div > button {
+  width: 100% !important;
   min-height: 120px !important;
   border-radius: 12px !important;
+}
+
+/* Optional: avoid extra spacing above the button */
+div[data-testid="column"] > div {
+  padding-top: 0px !important;
 }
 </style>
 """,
@@ -46,7 +66,15 @@ def _reset_widget_keys(keys: list[str]) -> None:
 
 
 def reset_app_state() -> None:
-    _reset_widget_keys(["selected_letters_input", "k_groups", "limit_group_size", "cap_pct"])
+    _reset_widget_keys(
+        [
+            "id_letters_input",
+            "selected_letters_input",
+            "k_groups",
+            "limit_group_size",
+            "cap_pct",
+        ]
+    )
     st.session_state["current_file_sig"] = None
 
 
@@ -122,13 +150,12 @@ def to_0_100(x: np.ndarray) -> np.ndarray:
 
 
 # -------------------------
-# Core compute (BLANKS DO NOT COUNT AT ALL)
-# - Any student with ANY blank among selected score columns is EXCLUDED from everything:
-#   grouping, cap %, overall score, output table.
+# Core compute (BLANKS DO NOT COUNT)
+# - Any student with ANY blank among selected score columns is excluded from everything.
 # -------------------------
 def compute_groups(
     df: pd.DataFrame,
-    student_id_col: str,
+    id_col: str,
     selected_score_cols: list[str],
     k: int,
     cap_pct: int,
@@ -145,7 +172,7 @@ def compute_groups(
     X = work[feature_keys].to_numpy(dtype=float)
     valid_mask = ~np.any(np.isnan(X), axis=1)
 
-    excluded_cols = [student_id_col] + selected_score_cols
+    excluded_cols = [id_col] + selected_score_cols
     excluded = work.loc[~valid_mask, excluded_cols].copy()
     valid_work = work.loc[valid_mask].copy()
 
@@ -232,8 +259,6 @@ def compute_groups(
     )
     cluster_to_groupnum = {cl: i + 1 for i, cl in enumerate(order_best)}
     valid_work["Group"] = valid_work["_cluster_internal"].map(cluster_to_groupnum).astype(int)
-
-    # Group name WITHOUT grade
     valid_work["Group Name"] = valid_work["Group"].apply(lambda g: f"Group {g}")
 
     return valid_work, excluded, weights_view, cap_adjust_note
@@ -245,16 +270,19 @@ def compute_groups(
 st.set_page_config(page_title="WAB Classroom Assignment Program", layout="wide")
 st.title("WAB Classroom Assignment Program")
 
-# Upload / remove file (button aligned beside uploader)
+# Upload / remove file (aligned row)
 if "uploader_key" not in st.session_state:
     st.session_state["uploader_key"] = 0
 if "current_file_sig" not in st.session_state:
     st.session_state["current_file_sig"] = None
 
+st.subheader("Upload")  # shared label so both elements align perfectly
+
 c1, c2 = st.columns([4, 1], vertical_alignment="top")
 with c1:
     uploaded = st.file_uploader(
-        "Upload CSV (UTF-8 recommended)",
+        label="",
+        label_visibility="collapsed",
         type=["csv"],
         key=f"uploader_{st.session_state['uploader_key']}",
     )
@@ -276,13 +304,42 @@ if st.session_state["current_file_sig"] != file_sig:
 df = read_csv_cached(uploaded.getvalue())
 df_work = df.copy()
 
-# Ensure student_id
-cols_norm = {c: norm(c) for c in df_work.columns}
-student_id_col = next((c for c, n in cols_norm.items() if n in ["student_id", "student id", "id"]), None)
-if student_id_col is None:
-    df_work["student_id"] = [f"S{i+1:03d}" for i in range(len(df_work))]
-    student_id_col = "student_id"
+# Student name column (Excel letter)
+st.subheader("Student name column (Excel letter)")
+st.caption("Type ONE Excel letter for the student name column. Example: A  OR  AB")
 
+id_letters = st.text_input(
+    "Student name column",
+    value="",
+    key="id_letters_input",
+)
+
+id_col = None
+if id_letters.strip():
+    idxs = parse_excel_letters_input(id_letters)
+    if len(idxs) != 1:
+        st.error("Please type exactly ONE column letter for the student name column (example: A or AB).")
+        st.stop()
+    idx = idxs[0]
+    if idx < 0 or idx >= len(df_work.columns):
+        st.error(f"Column out of range: {index_to_excel_col(idx)} (file has {len(df_work.columns)} columns)")
+        st.stop()
+    id_col = df_work.columns[idx]
+    st.dataframe(
+        pd.DataFrame({"Excel": [index_to_excel_col(idx)], "Column title": [id_col]}),
+        width="stretch",
+        height=110,
+    )
+else:
+    # fallback: try common names; if none, create student_id
+    cols_norm = {c: norm(c) for c in df_work.columns}
+    id_col = next((c for c, n in cols_norm.items() if n in ["student_id", "student id", "id", "name", "student name"]), None)
+    if id_col is None:
+        df_work["student_id"] = [f"S{i+1:03d}" for i in range(len(df_work))]
+        id_col = "student_id"
+        st.info("No student name column selected — created a 'student_id' column automatically.")
+
+# Scores selection (Excel letters)
 st.subheader("Select score columns (Excel letters)")
 st.caption("Examples: A, B, C  OR  A B C")
 
@@ -304,8 +361,15 @@ try:
                 )
         selected_score_cols = [df_work.columns[i] for i in idxs]
 
+        # prevent ID col as score col
+        if id_col in selected_score_cols:
+            selected_score_cols = [c for c in selected_score_cols if c != id_col]
+            st.warning("You included the student name column in the score list — it was removed automatically.")
+
         st.dataframe(
-            pd.DataFrame({"Excel": [index_to_excel_col(i) for i in idxs], "Column title": selected_score_cols}),
+            pd.DataFrame(
+                {"Excel": [index_to_excel_col(i) for i in idxs], "Column title": [df_work.columns[i] for i in idxs]}
+            ),
             width="stretch",
             height=210,
         )
@@ -316,6 +380,7 @@ if not selected_score_cols:
     st.info("Type at least 1 Excel column letter to continue.")
     st.stop()
 
+# Weights per selected score
 st.subheader("Weights (0–10 per selected score)")
 st.caption("0 = off • 10 = strongest (normalized automatically)")
 
@@ -323,7 +388,11 @@ weights_key = f"weights_0to10_{abs(hash(tuple(selected_score_cols))) % 10**9}"
 
 if len(selected_score_cols) == 1:
     weights_0to10 = np.array([10], dtype=int)
-    st.dataframe(pd.DataFrame({"score": selected_score_cols, "weight_0_to_10": [10]}), width="stretch")
+    st.dataframe(
+        pd.DataFrame({"score": selected_score_cols, "weight_0_to_10": [10]}),
+        width="stretch",
+        height=110,
+    )
 else:
     default_df = pd.DataFrame({"score": selected_score_cols, "weight_0_to_10": [10] * len(selected_score_cols)})
     w_df = st.data_editor(
@@ -338,6 +407,7 @@ else:
     )
     weights_0to10 = pd.to_numeric(w_df["weight_0_to_10"], errors="coerce").fillna(0).to_numpy(dtype=int)
 
+# Grouping
 st.subheader("Grouping settings")
 k = st.slider("Number of groups (1–10)", 1, 10, 3, key="k_groups")
 limit_group_size = st.checkbox("Limit max group size", value=False, key="limit_group_size")
@@ -347,7 +417,7 @@ try:
     with st.spinner("Recalculating…"):
         valid_work, excluded, weights_view, cap_note = compute_groups(
             df=df_work,
-            student_id_col=student_id_col,
+            id_col=id_col,
             selected_score_cols=selected_score_cols,
             k=k,
             cap_pct=cap_pct,
@@ -364,10 +434,10 @@ st.subheader("Weights used")
 st.dataframe(weights_view, width="stretch")
 
 st.subheader("Results")
-show_cols = ["Overall Score", student_id_col, "Group Name"] + selected_score_cols
+show_cols = ["Overall Score", id_col, "Group Name"] + selected_score_cols
 out_table = (
     valid_work[show_cols]
-    .sort_values(["Overall Score", "Group Name", student_id_col], ascending=[False, True, True])
+    .sort_values(["Overall Score", "Group Name", id_col], ascending=[False, True, True])
     .reset_index(drop=True)
 )
 st.dataframe(out_table, width="stretch", height=560)

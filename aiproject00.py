@@ -5,7 +5,7 @@ import numpy as np
 
 
 # -------------------------
-# Helpers: Excel letters
+# Excel letter helpers
 # -------------------------
 def index_to_excel_col(i: int) -> str:
     n = i + 1
@@ -70,49 +70,19 @@ def to_0_100(x: np.ndarray) -> np.ndarray:
 
 
 # -------------------------
-# Robust CSV reader (AUTO header detection + drop empty columns)
+# Robust CSV reader (AUTO header detection)
+# IMPORTANT: does NOT delete/drop ANY columns.
 # -------------------------
-def _clean_columns(df: pd.DataFrame) -> pd.DataFrame:
-    # Strip column names
-    df = df.copy()
-    df.columns = [str(c).strip() for c in df.columns]
-
-    # Drop columns that are completely empty (all NaN) OR are Unnamed and empty
-    # This fixes "tons of trailing commas" exports.
-    all_nan_cols = [c for c in df.columns if df[c].isna().all()]
-    df = df.drop(columns=all_nan_cols, errors="ignore")
-
-    # Drop columns that are "Unnamed: x" AND have no real data
-    unnamed = [c for c in df.columns if str(c).strip().lower().startswith("unnamed")]
-    drop_unnamed = []
-    for c in unnamed:
-        s = df[c]
-        # if all values are NA or empty strings -> drop
-        if s.isna().all() or (s.astype(str).str.strip().replace("nan", "").eq("").all()):
-            drop_unnamed.append(c)
-    df = df.drop(columns=drop_unnamed, errors="ignore")
-    return df
-
-
 def _header_score(row: list[str]) -> float:
-    """
-    Score how 'header-like' a row is.
-    Higher = more likely to be a real header.
-    """
     cells = [("" if x is None else str(x).strip()) for x in row]
     nonempty = [c for c in cells if c != "" and c.lower() != "nan"]
     if len(nonempty) == 0:
         return -1.0
 
     uniq = len(set([c.lower() for c in nonempty]))
-    # prefer rows with many non-empty + many unique tokens
     score = len(nonempty) + 0.5 * uniq
 
-    # penalize rows that look like "Demographics", "MAP..." spanning titles (few unique repeated)
-    if uniq <= 2 and len(nonempty) >= 5:
-        score -= 2.0
-
-    # penalize rows that are mostly numbers (headers usually text)
+    # penalize rows that are mostly numbers
     numeric_like = 0
     for c in nonempty:
         if re.fullmatch(r"[-+]?\d+(\.\d+)?", c):
@@ -124,16 +94,11 @@ def _header_score(row: list[str]) -> float:
 
 
 @st.cache_data(show_spinner=False)
-def read_csv_smart(file_bytes: bytes) -> tuple[pd.DataFrame, int]:
-    """
-    1) read first N rows without header, find most header-like row index
-    2) read full CSV using that row as header
-    3) drop empty/trailing columns
-    Returns (df, header_row_index)
-    """
-    # Try utf-8-sig first (Excel often adds BOM)
-    # Read small preview with header=None to detect header row
+def read_csv_smart(file_bytes: bytes) -> pd.DataFrame:
     preview = None
+    used_enc = None
+
+    # Try common encodings
     for enc in ("utf-8-sig", "utf-8", "cp949", "latin1"):
         try:
             preview = pd.read_csv(
@@ -150,7 +115,6 @@ def read_csv_smart(file_bytes: bytes) -> tuple[pd.DataFrame, int]:
             continue
 
     if preview is None:
-        # last resort
         preview = pd.read_csv(
             pd.io.common.BytesIO(file_bytes),
             header=None,
@@ -160,7 +124,6 @@ def read_csv_smart(file_bytes: bytes) -> tuple[pd.DataFrame, int]:
         )
         used_enc = "utf-8"
 
-    # choose best header row among first 40 rows
     best_i = 0
     best_score = -1e9
     for i in range(len(preview)):
@@ -170,7 +133,6 @@ def read_csv_smart(file_bytes: bytes) -> tuple[pd.DataFrame, int]:
             best_score = sc
             best_i = i
 
-    # read full with detected header row
     df = pd.read_csv(
         pd.io.common.BytesIO(file_bytes),
         header=best_i,
@@ -178,12 +140,13 @@ def read_csv_smart(file_bytes: bytes) -> tuple[pd.DataFrame, int]:
         engine="python",
     )
 
-    df = _clean_columns(df)
-    return df, best_i
+    # IMPORTANT: do NOT drop columns. Just strip header strings.
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
 
 
 # -------------------------
-# Partial-score standardize + masked kmeans
+# Partial-score normalize + masked kmeans
 # -------------------------
 def standardize_with_nans(X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     mask = ~np.isnan(X)
@@ -212,8 +175,7 @@ def masked_weighted_dist2(Z: np.ndarray, mask: np.ndarray, C: np.ndarray, w: np.
     k = C.shape[0]
     dist2 = np.full((n, k), np.inf, dtype=float)
 
-    w = w.astype(float)
-    w = np.clip(w, 0.0, None)
+    w = np.clip(w.astype(float), 0.0, None)
 
     for i in range(n):
         m = mask[i]
@@ -269,7 +231,6 @@ def masked_kmeans(Z: np.ndarray, mask: np.ndarray, weights: np.ndarray, k: int, 
 def compute_groups_partial(df, id_col, selected_score_cols, k, cap_pct, weights_0to10):
     work = df.copy()
 
-    # convert selected score cols to numeric (blanks->NaN)
     for c in selected_score_cols:
         work[c] = pd.to_numeric(work[c], errors="coerce")
 
@@ -340,7 +301,6 @@ def compute_groups_partial(df, id_col, selected_score_cols, k, cap_pct, weights_
 
     valid_work["_cluster_internal"] = assigned
 
-    # Overall Score: weighted average over available features per student (renormalize weights per row)
     overall_proxy = np.zeros(n_valid, dtype=float)
     for i in range(n_valid):
         m = mask_valid[i] & (weights > 0)
@@ -354,7 +314,6 @@ def compute_groups_partial(df, id_col, selected_score_cols, k, cap_pct, weights_
     valid_work["_level_proxy"] = overall_proxy
     valid_work["Overall Score"] = np.round(to_0_100(overall_proxy), 2)
 
-    # Group 1 = best cluster
     order_best = (
         valid_work.groupby("_cluster_internal")["_level_proxy"]
         .mean()
@@ -381,20 +340,16 @@ if uploaded is None:
     st.stop()
 
 file_bytes = uploaded.getvalue()
-file_sig = (len(file_bytes), hash(file_bytes[:5000]))  # lightweight signature
+file_sig = (len(file_bytes), hash(file_bytes[:5000]))
 
-# Reset widgets when file changes (prevents showing previous clicked data)
+# Reset widgets when file changes
 if st.session_state.get("_file_sig") != file_sig:
     st.session_state["_file_sig"] = file_sig
-    for k in list(st.session_state.keys()):
-        if k.startswith(("id_letters_input", "selected_letters_input", "k_groups", "limit_group_size", "cap_pct", "weights_0to10_")):
-            st.session_state.pop(k, None)
+    for kk in list(st.session_state.keys()):
+        if kk.startswith(("id_letters_input", "selected_letters_input", "k_groups", "limit_group_size", "cap_pct", "weights_0to10_")):
+            st.session_state.pop(kk, None)
 
-df, detected_header_row = read_csv_smart(file_bytes)
-
-# (Optional) show detected header row in an expander (hidden by default)
-with st.expander("Header detection (advanced)"):
-    st.write(f"Detected header row index (0-based): {detected_header_row}")
+df = read_csv_smart(file_bytes)
 
 # Student name column
 st.subheader("Student name column (Excel letter)")
@@ -417,9 +372,7 @@ if id_letters.strip():
         height=110,
     )
 else:
-    # fallback: try common names; if none, create student_id silently
-    cols = [str(c).strip() for c in df.columns]
-    lowered = [c.lower() for c in cols]
+    lowered = [str(c).strip().lower() for c in df.columns]
     id_col = None
     for cand in ["student_id", "student id", "id", "name", "student name", "student number"]:
         if cand in lowered:

@@ -4,80 +4,11 @@ import pandas as pd
 import numpy as np
 
 from sklearn.preprocessing import StandardScaler
-from sklearn.cluster import KMeans
-
-
-# -------------------------
-# Style: uploader + remove button alignment
-# - Hide uploader label and use one shared label above both
-# - Force dropzone and Remove button to share the same min-height
-# -------------------------
-st.markdown(
-    """
-<style>
-/* Shared "Upload" row visuals */
-div[data-testid="stFileUploader"] {
-  margin-top: 0px !important;
-}
-
-/* Dropzone fixed height */
-div[data-testid="stFileUploader"] section {
-  min-height: 120px !important;
-}
-div[data-testid="stFileUploaderDropzone"] {
-  min-height: 120px !important;
-  padding-top: 18px !important;
-  padding-bottom: 18px !important;
-  border-radius: 12px !important;
-}
-
-/* Make the Remove button container stretch and match height */
-div[data-testid="stButton"] {
-  height: 100% !important;
-  display: flex !important;
-}
-div[data-testid="stButton"] > div {
-  width: 100% !important;
-  display: flex !important;
-}
-div[data-testid="stButton"] > div > button {
-  width: 100% !important;
-  min-height: 120px !important;
-  border-radius: 12px !important;
-}
-
-/* Optional: avoid extra spacing above the button */
-div[data-testid="column"] > div {
-  padding-top: 0px !important;
-}
-</style>
-""",
-    unsafe_allow_html=True,
-)
 
 
 # -------------------------
 # Helpers
 # -------------------------
-def _reset_widget_keys(keys: list[str]) -> None:
-    for k in keys:
-        if k in st.session_state:
-            del st.session_state[k]
-
-
-def reset_app_state() -> None:
-    _reset_widget_keys(
-        [
-            "id_letters_input",
-            "selected_letters_input",
-            "k_groups",
-            "limit_group_size",
-            "cap_pct",
-        ]
-    )
-    st.session_state["current_file_sig"] = None
-
-
 def norm(s: str) -> str:
     return re.sub(r"\s+", " ", str(s).strip().lower())
 
@@ -149,11 +80,115 @@ def to_0_100(x: np.ndarray) -> np.ndarray:
     return (x - mn) / (mx - mn) * 100.0
 
 
+def standardize_with_nans(X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Standardize each column using mean/std computed on available values only.
+    NaNs remain NaN.
+    Returns Z (standardized) and mask (True where value exists).
+    """
+    mask = ~np.isnan(X)
+    Z = X.astype(float).copy()
+
+    for j in range(X.shape[1]):
+        col = X[:, j]
+        m = mask[:, j]
+        if m.sum() == 0:
+            Z[:, j] = np.nan
+            continue
+        mean = np.mean(col[m])
+        std = np.std(col[m])
+        if std == 0 or not np.isfinite(std):
+            # if no variance, set standardized values to 0 where present
+            Z[m, j] = 0.0
+            Z[~m, j] = np.nan
+        else:
+            Z[m, j] = (col[m] - mean) / std
+            Z[~m, j] = np.nan
+
+    return Z, mask
+
+
+def masked_weighted_dist2(Z: np.ndarray, mask: np.ndarray, C: np.ndarray, w: np.ndarray) -> np.ndarray:
+    """
+    Compute squared distances from each row in Z to each centroid in C
+    using only present features per row. Missing features are completely ignored.
+
+    dist2[i, g] = sum_j w_j * (Z_ij - C_gj)^2 over present j / sum_j w_j over present j
+    If a row has no present weighted features -> dist2 = +inf
+    """
+    n, d = Z.shape
+    k = C.shape[0]
+    dist2 = np.full((n, k), np.inf, dtype=float)
+
+    w = w.astype(float)
+    w = np.clip(w, 0.0, None)
+
+    for i in range(n):
+        m = mask[i]  # present
+        wsum = float(np.sum(w[m]))
+        if wsum <= 0:
+            continue
+        zi = Z[i]
+        # compute for each centroid
+        for g in range(k):
+            diff = zi[m] - C[g, m]
+            dist2[i, g] = float(np.sum(w[m] * (diff ** 2)) / wsum)
+
+    return dist2
+
+
+def masked_kmeans(Z: np.ndarray, mask: np.ndarray, weights: np.ndarray, k: int, max_iter: int = 40, seed: int = 0):
+    """
+    Custom KMeans that ignores missing features per student (completely neglected).
+    """
+    rng = np.random.default_rng(seed)
+    n, d = Z.shape
+
+    # init centroids: pick random rows; missing dims init to 0
+    init_idx = rng.choice(n, size=k, replace=(n < k))
+    C = np.zeros((k, d), dtype=float)
+    for g, idx in enumerate(init_idx):
+        C[g, :] = 0.0
+        m = mask[idx]
+        C[g, m] = Z[idx, m]
+
+    labels = np.full(n, -1, dtype=int)
+
+    for _ in range(max_iter):
+        dist2 = masked_weighted_dist2(Z, mask, C, weights)
+        new_labels = np.argmin(dist2, axis=1)
+
+        if np.array_equal(new_labels, labels):
+            break
+        labels = new_labels
+
+        # update centroids: mean of available z-values per feature inside cluster
+        for g in range(k):
+            idxs = np.where(labels == g)[0]
+            if len(idxs) == 0:
+                # re-seed empty cluster
+                ridx = rng.integers(0, n)
+                C[g, :] = 0.0
+                m = mask[ridx]
+                C[g, m] = Z[ridx, m]
+                continue
+
+            for j in range(d):
+                mj = mask[idxs, j]
+                if np.any(mj):
+                    C[g, j] = float(np.mean(Z[idxs[mj], j]))
+                else:
+                    C[g, j] = 0.0
+
+    return labels, C
+
+
 # -------------------------
-# Core compute (BLANKS DO NOT COUNT)
-# - Any student with ANY blank among selected score columns is excluded from everything.
+# Core compute (PARTIAL SCORES ALLOWED)
+# - If a score is blank for a student, that score is COMPLETELY IGNORED for that student.
+# - Only students with ALL selected scores blank are excluded.
 # -------------------------
-def compute_groups(
+def compute_groups_partial(
     df: pd.DataFrame,
     id_col: str,
     selected_score_cols: list[str],
@@ -162,60 +197,59 @@ def compute_groups(
     weights_0to10: np.ndarray,
 ):
     work = df.copy()
-    feature_keys = list(selected_score_cols)
 
     # numeric conversion: blanks -> NaN
-    for c in feature_keys:
+    for c in selected_score_cols:
         work[c] = pd.to_numeric(work[c], errors="coerce")
 
-    # Exclude any row with ANY missing selected score (no imputation)
-    X = work[feature_keys].to_numpy(dtype=float)
-    valid_mask = ~np.any(np.isnan(X), axis=1)
+    X = work[selected_score_cols].to_numpy(dtype=float)
+    Z, mask = standardize_with_nans(X)
 
-    excluded_cols = [id_col] + selected_score_cols
-    excluded = work.loc[~valid_mask, excluded_cols].copy()
-    valid_work = work.loc[valid_mask].copy()
+    raw = np.array(weights_0to10, dtype=float)
+    if raw.shape[0] != len(selected_score_cols):
+        raise ValueError("Weights do not match the selected score columns.")
+    raw = np.clip(raw, 0.0, None)
 
+    # Exclude students who have ZERO usable weighted scores
+    usable_w = (raw > 0).astype(bool)
+    row_has_any = np.any(mask[:, usable_w], axis=1) if np.any(usable_w) else np.zeros(len(work), dtype=bool)
+
+    excluded = work.loc[~row_has_any, [id_col] + selected_score_cols].copy()
+    valid_work = work.loc[row_has_any].copy()
+
+    Z_valid = Z[row_has_any]
+    mask_valid = mask[row_has_any]
     n_valid = len(valid_work)
+
     if n_valid == 0:
-        raise ValueError("All students were excluded (missing selected scores).")
+        raise ValueError("No students have any usable scores (all selected scores are blank or weights are 0).")
+
     if k > n_valid:
         raise ValueError(f"Number of groups ({k}) cannot exceed valid students ({n_valid}).")
 
-    # weights (0..10 each)
-    raw = np.array(weights_0to10, dtype=float)
-    if raw.shape[0] != len(feature_keys):
-        raise ValueError("Weights do not match the selected score columns.")
     if raw.sum() <= 0:
         raise ValueError("All weights are 0. Set at least one weight above 0.")
 
     weights = (raw / raw.sum()).astype(float)
     weights_view = pd.DataFrame(
-        {"score": feature_keys, "final_weight_%": np.round(weights * 100.0, 2)}
+        {"score": selected_score_cols, "final_weight_%": np.round(weights * 100.0, 2)}
     )
 
-    # Standardize (valid-only)
-    X_valid = valid_work[feature_keys].to_numpy(dtype=float)
-    Z = StandardScaler().fit_transform(X_valid)
+    # --- masked kmeans (missing values are ignored per student)
+    labels, C = masked_kmeans(Z_valid, mask_valid, weights, k=k, max_iter=50, seed=0)
 
-    # Weighted KMeans space
-    Z_w = Z * np.sqrt(weights)
-
-    # Fit KMeans
-    km = KMeans(n_clusters=k, random_state=0, n_init=10).fit(Z_w)
-
-    centroids = km.cluster_centers_
-    dists = np.linalg.norm(Z_w[:, None, :] - centroids[None, :, :], axis=2)
+    # distances for optional cap assignment
+    dist2 = masked_weighted_dist2(Z_valid, mask_valid, C, weights)
+    dists = np.sqrt(np.maximum(dist2, 0.0))
 
     cap_adjust_note = None
 
     if cap_pct == 0:
-        assigned = np.argmin(dists, axis=1)
+        assigned = labels
     else:
         cap = int(np.ceil((cap_pct / 100.0) * n_valid))
         cap = max(cap, 1)
 
-        # minimum cap needed to fit everyone
         min_cap = int(np.ceil(n_valid / k))
         if cap < min_cap:
             cap = min_cap
@@ -224,9 +258,8 @@ def compute_groups(
                 f"Auto-adjusted to at least {int(np.ceil(100 * cap / n_valid))}%."
             )
 
-        # cap assignment
         sorted_d = np.sort(dists, axis=1)
-        margin = sorted_d[:, 1] - sorted_d[:, 0]
+        margin = sorted_d[:, 1] - sorted_d[:, 0] if k >= 2 else np.full(n_valid, 0.0)
         sorted_idx = np.argsort(-margin)
 
         remaining = np.array([cap] * k, dtype=int)
@@ -244,12 +277,22 @@ def compute_groups(
 
     valid_work["_cluster_internal"] = assigned
 
-    # Overall Score (0..100)
-    level_proxy = (Z * weights).sum(axis=1)
-    valid_work["_level_proxy"] = level_proxy
-    valid_work["Overall Score"] = np.round(to_0_100(level_proxy), 2)
+    # --- Overall Score: weighted average of available standardized features per student
+    # Missing features are ignored by renormalizing weights per row.
+    overall_proxy = np.zeros(n_valid, dtype=float)
+    for i in range(n_valid):
+        m = mask_valid[i] & (weights > 0)
+        wsum = float(np.sum(weights[m]))
+        if wsum <= 0:
+            overall_proxy[i] = 0.0
+        else:
+            wrow = weights[m] / wsum
+            overall_proxy[i] = float(np.sum(wrow * Z_valid[i, m]))
 
-    # Group 1 = best cluster
+    valid_work["_level_proxy"] = overall_proxy
+    valid_work["Overall Score"] = np.round(to_0_100(overall_proxy), 2)
+
+    # Group 1 = best cluster (highest mean proxy)
     order_best = (
         valid_work.groupby("_cluster_internal")["_level_proxy"]
         .mean()
@@ -270,36 +313,10 @@ def compute_groups(
 st.set_page_config(page_title="WAB Classroom Assignment Program", layout="wide")
 st.title("WAB Classroom Assignment Program")
 
-# Upload / remove file (aligned row)
-if "uploader_key" not in st.session_state:
-    st.session_state["uploader_key"] = 0
-if "current_file_sig" not in st.session_state:
-    st.session_state["current_file_sig"] = None
-
-st.subheader("Upload")  # shared label so both elements align perfectly
-
-c1, c2 = st.columns([4, 1], vertical_alignment="top")
-with c1:
-    uploaded = st.file_uploader(
-        label="",
-        label_visibility="collapsed",
-        type=["csv"],
-        key=f"uploader_{st.session_state['uploader_key']}",
-    )
-with c2:
-    if st.button("Remove file", use_container_width=True):
-        st.session_state["uploader_key"] += 1
-        reset_app_state()
-        st.rerun()
-
+uploaded = st.file_uploader("Upload CSV (UTF-8 recommended)", type=["csv"])
 if uploaded is None:
     st.info("Upload a CSV file to begin.")
     st.stop()
-
-file_sig = (uploaded.name, getattr(uploaded, "size", None))
-if st.session_state["current_file_sig"] != file_sig:
-    reset_app_state()
-    st.session_state["current_file_sig"] = file_sig
 
 df = read_csv_cached(uploaded.getvalue())
 df_work = df.copy()
@@ -308,11 +325,7 @@ df_work = df.copy()
 st.subheader("Student name column (Excel letter)")
 st.caption("Type ONE Excel letter for the student name column. Example: A  OR  AB")
 
-id_letters = st.text_input(
-    "Student name column",
-    value="",
-    key="id_letters_input",
-)
+id_letters = st.text_input("Student name column", value="", key="id_letters_input")
 
 id_col = None
 if id_letters.strip():
@@ -333,7 +346,10 @@ if id_letters.strip():
 else:
     # fallback: try common names; if none, create student_id
     cols_norm = {c: norm(c) for c in df_work.columns}
-    id_col = next((c for c, n in cols_norm.items() if n in ["student_id", "student id", "id", "name", "student name"]), None)
+    id_col = next(
+        (c for c, n in cols_norm.items() if n in ["student_id", "student id", "id", "name", "student name"]),
+        None,
+    )
     if id_col is None:
         df_work["student_id"] = [f"S{i+1:03d}" for i in range(len(df_work))]
         id_col = "student_id"
@@ -415,7 +431,7 @@ cap_pct = st.slider("Max % per group", 1, 40, 20, key="cap_pct") if limit_group_
 
 try:
     with st.spinner("Recalculating…"):
-        valid_work, excluded, weights_view, cap_note = compute_groups(
+        valid_work, excluded, weights_view, cap_note = compute_groups_partial(
             df=df_work,
             id_col=id_col,
             selected_score_cols=selected_score_cols,
@@ -442,11 +458,15 @@ out_table = (
 )
 st.dataframe(out_table, width="stretch", height=560)
 
+# Optional: show excluded only if any
+if len(excluded) > 0:
+    with st.expander(f"Students excluded (no usable selected scores): {len(excluded)}"):
+        st.dataframe(excluded.reset_index(drop=True), width="stretch", height=240)
+
 st.subheader("Export")
 st.download_button(
     "Download CSV (valid students)",
     data=out_table.to_csv(index=False),
     file_name="students_with_groups_overall_score.csv",
     mime="text/csv",
-    use_container_width=True,
 )

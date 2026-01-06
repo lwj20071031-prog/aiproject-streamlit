@@ -20,100 +20,171 @@ def reset_app_state(keep_grade: bool = True) -> None:
         "k_groups",
         "limit_group_size",
         "cap_pct",
-        "weights_table",
+        "weights_table_0to10",
     ]
     if not keep_grade:
         keys_to_reset.append("grade_main")
     _reset_widget_keys(keys_to_reset)
     st.session_state["current_file_sig"] = None
 
+def norm(s: str) -> str:
+    return re.sub(r"\s+", " ", str(s).strip().lower())
+
+# Cache only the CSV read (safe). Any control change still recomputes model.
+@st.cache_data(show_spinner=False)
+def read_csv_cached(file_bytes: bytes) -> pd.DataFrame:
+    return pd.read_csv(pd.io.common.BytesIO(file_bytes))
+
 # -------------------------
-# Page + Professional UI
+# Core compute (always recalculated on UI changes)
+# -------------------------
+def compute_groups(
+    df: pd.DataFrame,
+    selected_grade: str,
+    student_id_col: str,
+    map_col: str | None,
+    unit_test_cols: list[str],
+    selected_score_cols: list[str],
+    k: int,
+    cap_pct: int,
+    use_map: bool,
+    selected_unit_tests: list[str],
+    weights_0to10: np.ndarray,
+):
+    work = df.copy()
+
+    # MAP percentile if used
+    if use_map and map_col is not None:
+        map_vals = pd.to_numeric(work[map_col], errors="coerce")
+        work["map_percentile"] = map_vals.rank(pct=True) * 100.0
+
+    # Build features in model order
+    feature_display, feature_keys = [], []
+    if use_map and map_col is not None:
+        feature_display.append("MAP (percentile within uploaded file)")
+        feature_keys.append("map_percentile")
+    for c in selected_unit_tests:
+        feature_display.append(c)
+        feature_keys.append(c)
+
+    # Force numeric → NaN for invalid
+    for c in feature_keys:
+        work[c] = pd.to_numeric(work[c], errors="coerce")
+
+    X = work[feature_keys].to_numpy(dtype=float)
+    valid_mask = ~np.any(np.isnan(X), axis=1)
+
+    excluded_cols = [student_id_col]
+    if map_col is not None:
+        excluded_cols.append(map_col)
+    excluded_cols += unit_test_cols
+
+    excluded = work.loc[~valid_mask, excluded_cols].copy()
+    valid_work = work.loc[valid_mask].copy()
+
+    n_valid = len(valid_work)
+    if n_valid == 0:
+        raise ValueError("All students are missing selected score(s).")
+
+    if k > n_valid:
+        raise ValueError(f"Groups ({k}) cannot be greater than valid students ({n_valid}).")
+
+    # Weights: 0..10 → 0..100 → normalize
+    raw = np.array(weights_0to10, dtype=float)
+    if raw.sum() <= 0:
+        raise ValueError("All weights are 0. Set at least one score weight above 0.")
+    raw_percent = raw * 10.0
+    weights = (raw_percent / raw_percent.sum()).astype(float)
+
+    # Standardize on valid only
+    X_valid = valid_work[feature_keys].to_numpy(dtype=float)
+    Z = StandardScaler().fit_transform(X_valid)
+
+    # Weighted KMeans (correct way)
+    Z_w = Z * np.sqrt(weights)
+
+    km = KMeans(n_clusters=k, random_state=0, n_init=10)
+    km.fit(Z_w)
+    centroids = km.cluster_centers_
+
+    dists = np.linalg.norm(Z_w[:, None, :] - centroids[None, :, :], axis=2)
+
+    # Assignment with optional cap
+    if cap_pct == 0:
+        assigned = np.argmin(dists, axis=1)
+    else:
+        cap = int(np.ceil((cap_pct / 100.0) * n_valid))
+        cap = max(cap, 1)
+        if k * cap < n_valid:
+            raise ValueError(
+                f"Impossible: {k} groups × max {cap}/group = {k*cap}, but valid class size is {n_valid}."
+            )
+
+        sorted_idx = np.argsort(np.sort(dists, axis=1)[:, 1] - np.sort(dists, axis=1)[:, 0])
+        remaining = np.array([cap] * k, dtype=int)
+        assigned = np.full(n_valid, -1, dtype=int)
+
+        for i in sorted_idx:
+            for g in np.argsort(dists[i]):
+                if remaining[g] > 0:
+                    assigned[i] = g
+                    remaining[g] -= 1
+                    break
+        if np.any(assigned == -1):
+            raise ValueError("Assignment failed. Disable limit or increase max %.")
+
+    valid_work["_cluster_internal"] = assigned
+
+    # Rank clusters → Group 1 highest
+    level_proxy = (Z * weights).sum(axis=1)
+    valid_work["_level_proxy"] = level_proxy
+    order_best = (
+        valid_work.groupby("_cluster_internal")["_level_proxy"]
+        .mean()
+        .sort_values(ascending=False)
+        .index
+        .tolist()
+    )
+    cluster_to_groupnum = {cl: i + 1 for i, cl in enumerate(order_best)}
+    valid_work["Group"] = valid_work["_cluster_internal"].map(cluster_to_groupnum).astype(int)
+    valid_work["Group Name"] = valid_work["Group"].apply(lambda g: f"{selected_grade} • Group {g}")
+
+    # Return
+    weights_view = pd.DataFrame(
+        {"score": feature_display, "final_weight_%": np.round(weights * 100.0, 2)}
+    )
+    return valid_work, excluded, weights_view, feature_keys
+
+
+# -------------------------
+# UI
 # -------------------------
 st.set_page_config(page_title="Grouping Studio", layout="wide")
 
+# Minimal clean style
 st.markdown(
     """
     <style>
-      #MainMenu {visibility: hidden;}
-      footer {visibility: hidden;}
-      header {visibility: hidden;}
-
+      #MainMenu {visibility:hidden;}
+      footer {visibility:hidden;}
+      header {visibility:hidden;}
       .stApp{ background: linear-gradient(180deg, #FAFAFA 0%, #F5F5F7 100%); }
-      .block-container{ padding-top: 1.1rem; padding-bottom: 2.2rem; max-width: 1180px; }
-
-      .topbar{
-        display:flex; align-items:center; justify-content:space-between; gap:1rem;
-        padding: 0.95rem 1.05rem; border-radius: 16px;
-        background: rgba(255,255,255,.88); border: 1px solid rgba(0,0,0,.08);
-        box-shadow: 0 14px 40px rgba(0,0,0,.07); backdrop-filter: blur(10px);
-        margin-bottom: 0.9rem;
-      }
-      .brand{display:flex; align-items:center; gap:.75rem;}
-      .mark{
-        width: 34px; height: 34px; border-radius: 10px;
-        background: linear-gradient(135deg, #111827, #0B0B0F);
-        box-shadow: 0 10px 22px rgba(0,0,0,.20);
-      }
-      .title{ margin:0; font-size: 1.1rem; font-weight: 900; color: rgba(17,24,39,.92); letter-spacing: .2px; }
-      .subtitle{ margin:.1rem 0 0; font-size: .9rem; color: rgba(17,24,39,.60); }
-      .rule{
-        padding: .3rem .7rem; border-radius: 999px;
-        border: 1px solid rgba(0,0,0,.10); background: rgba(255,255,255,.92);
-        color: rgba(17,24,39,.86); font-weight: 800; font-size: .78rem; white-space: nowrap;
-      }
-      .card{
-        border-radius: 16px; padding: 1.05rem 1.05rem;
-        background: rgba(255,255,255,.88); border: 1px solid rgba(0,0,0,.08);
-        box-shadow: 0 14px 42px rgba(0,0,0,.06); backdrop-filter: blur(8px);
-        margin-bottom: .9rem;
-      }
-      .h{ margin: 0 0 .7rem 0; font-size: 1.02rem; font-weight: 900; color: rgba(17,24,39,.92); }
-      .muted{ color: rgba(17,24,39,.62); font-size: .92rem; }
-      .tiny{ color: rgba(17,24,39,.52); font-size: .84rem; }
-
-      .stSelectbox div[data-baseweb="select"] > div,
-      .stMultiSelect div[data-baseweb="select"] > div,
-      .stFileUploader div{
-        border-radius: 14px !important;
-      }
-      .stDownloadButton button, .stButton button{
-        border-radius: 999px !important;
-        padding: .65rem 1.05rem !important;
-        font-weight: 900 !important;
-      }
+      .block-container{ max-width: 1180px; padding-top: 1.1rem; }
+      .card{ border-radius:16px; padding:1.05rem; background:rgba(255,255,255,.88);
+             border:1px solid rgba(0,0,0,.08); box-shadow:0 14px 42px rgba(0,0,0,.06);
+             backdrop-filter: blur(8px); margin-bottom:.9rem; }
+      .h{ margin:0 0 .7rem 0; font-weight:900; font-size:1.02rem; color:rgba(17,24,39,.92);}
+      .muted{ color:rgba(17,24,39,.62); font-size:.92rem; }
+      .tiny{ color:rgba(17,24,39,.52); font-size:.84rem; }
+      .stDownloadButton button, .stButton button{ border-radius:999px !important; font-weight:900 !important; }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-st.markdown(
-    """
-    <div class="topbar">
-      <div class="brand">
-        <div class="mark"></div>
-        <div>
-          <div class="title">Grouping Studio</div>
-          <div class="subtitle">Upload → select scores → set weights → group → export</div>
-        </div>
-      </div>
-      <div class="rule">Group 1 = highest • MAP → percentile (0–100)</div>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+st.markdown("<div class='card'><div class='h'>Grouping Studio</div><div class='muted'>Any change updates results automatically.</div></div>", unsafe_allow_html=True)
 
-# -------------------------
-# Grade (grade-only)
-# -------------------------
-GRADE_CLASS_COUNT = {
-    "JG1": 2,
-    "SG1": 4,
-    "Grade 2": 4,
-    "Grade 3": 5,
-    "Grade 4": 5,
-    "Grade 5": 6,
-}
+GRADE_CLASS_COUNT = {"JG1": 2, "SG1": 4, "Grade 2": 4, "Grade 3": 5, "Grade 4": 5, "Grade 5": 6}
 
 st.markdown("<div class='card'>", unsafe_allow_html=True)
 st.markdown("<div class='h'>Grade</div>", unsafe_allow_html=True)
@@ -123,15 +194,9 @@ selected_grade = st.selectbox(
     format_func=lambda g: f"{g} ({GRADE_CLASS_COUNT[g]} classes)",
     key="grade_main",
 )
-st.markdown(
-    f"<div class='muted'>Classes in {selected_grade}: <b>{GRADE_CLASS_COUNT[selected_grade]}</b></div>",
-    unsafe_allow_html=True,
-)
 st.markdown("</div>", unsafe_allow_html=True)
 
-# -------------------------
-# Upload + Remove file
-# -------------------------
+# Upload / remove file
 if "uploader_key" not in st.session_state:
     st.session_state["uploader_key"] = 0
 if "current_file_sig" not in st.session_state:
@@ -139,43 +204,34 @@ if "current_file_sig" not in st.session_state:
 
 st.markdown("<div class='card'>", unsafe_allow_html=True)
 st.markdown("<div class='h'>Upload</div>", unsafe_allow_html=True)
-
-up_c1, up_c2 = st.columns([3, 1])
-with up_c1:
-    uploaded_file = st.file_uploader(
+u1, u2 = st.columns([3, 1])
+with u1:
+    uploaded = st.file_uploader(
         "Upload CSV (UTF-8 recommended)",
         type=["csv"],
         key=f"uploader_{st.session_state['uploader_key']}",
     )
-    st.markdown("<div class='tiny'>Excel → Save As → CSV UTF-8 recommended.</div>", unsafe_allow_html=True)
-
-with up_c2:
+with u2:
     if st.button("Remove file", use_container_width=True):
         st.session_state["uploader_key"] += 1
         reset_app_state(keep_grade=True)
         st.rerun()
-
 st.markdown("</div>", unsafe_allow_html=True)
 
-if uploaded_file is None:
+if uploaded is None:
     st.info("Upload a CSV file to begin.")
     st.stop()
 
-file_sig = (uploaded_file.name, getattr(uploaded_file, "size", None))
+file_sig = (uploaded.name, getattr(uploaded, "size", None))
 if st.session_state["current_file_sig"] != file_sig:
     reset_app_state(keep_grade=True)
     st.session_state["current_file_sig"] = file_sig
 
-df = pd.read_csv(uploaded_file)
+# Read CSV (cached by bytes)
+df = read_csv_cached(uploaded.getvalue())
 work = df.copy()
-n_students_total = len(work)
 
-# -------------------------
-# Column detection
-# -------------------------
-def norm(s: str) -> str:
-    return re.sub(r"\s+", " ", str(s).strip().lower())
-
+# Detect columns
 cols_norm = {c: norm(c) for c in work.columns}
 
 student_id_col = None
@@ -200,14 +256,10 @@ for c, n in cols_norm.items():
 unit_test_cols = [c for _, c in sorted(unit_pairs)]
 
 if map_col is None and len(unit_test_cols) == 0:
-    st.error("No MAP column and no 'math unit test N' columns (1..10). Check your CSV headers.")
+    st.error("No MAP column and no 'math unit test N' columns (1..10).")
     st.stop()
 
-# -------------------------
-# Score selection (DEFAULT EMPTY)
-# 1-score mode still works:
-# - If exactly one unit test selected => ignore MAP automatically
-# -------------------------
+# Score selection
 options = []
 if map_col is not None:
     options.append(map_col)
@@ -216,102 +268,50 @@ options += unit_test_cols
 st.markdown("<div class='card'>", unsafe_allow_html=True)
 st.markdown("<div class='h'>Select scores</div>", unsafe_allow_html=True)
 selected_score_cols = st.multiselect(
-    "Start empty — select 1 or more score columns",
+    "Select 1+ scores (works with 1 score only)",
     options=options,
     default=[],
     key="selected_scores",
 )
-st.markdown("<div class='tiny'>If you select only 1 unit test, grouping uses only that test (MAP ignored).</div>", unsafe_allow_html=True)
 st.markdown("</div>", unsafe_allow_html=True)
 
 if len(selected_score_cols) < 1:
     st.info("Select at least 1 score column to continue.")
     st.stop()
 
-only_one_selected = (len(selected_score_cols) == 1)
-selected_only = selected_score_cols[0] if only_one_selected else None
-
 use_map = (map_col is not None and map_col in selected_score_cols)
 selected_unit_tests = [c for c in selected_score_cols if c != map_col]
 
-if only_one_selected and (selected_only != map_col):
-    use_map = False
-    selected_unit_tests = [selected_only]
-
-# -------------------------
-# Create MAP percentile feature if needed
-# -------------------------
-if use_map:
-    map_vals = pd.to_numeric(work[map_col], errors="coerce")
-    work["map_percentile"] = map_vals.rank(pct=True) * 100.0
-
-# -------------------------
-# Per-test weighting system (editable table)
-# - Auto-normalizes to 100%
-# - If only 1 score selected -> 100% automatically
-# -------------------------
-feature_display = []
-feature_keys = []
-
-if use_map:
-    feature_display.append("MAP (percentile within uploaded file)")
-    feature_keys.append("map_percentile")
-
-for c in selected_unit_tests:
-    feature_display.append(c)
-    feature_keys.append(c)
-
-num_features = len(feature_keys)
-if num_features < 1:
-    st.error("No usable scores selected.")
-    st.stop()
+# Weights 0..10 per selected score
+feature_display = (["MAP (percentile within uploaded file)"] if use_map else []) + selected_unit_tests
+num_features = len(feature_display)
 
 st.markdown("<div class='card'>", unsafe_allow_html=True)
-st.markdown("<div class='h'>Weights (per selected score)</div>", unsafe_allow_html=True)
+st.markdown("<div class='h'>Weights (0–10 per score)</div>", unsafe_allow_html=True)
+st.markdown("<div class='tiny'>0=0% • 1=10% • … • 10=100% (auto-normalized across selected scores)</div>", unsafe_allow_html=True)
 
 if num_features == 1:
-    st.info("Only one score selected → it automatically becomes 100%.")
-    weights = np.array([1.0], dtype=float)
-    st.dataframe(pd.DataFrame({"score": feature_display, "weight_%": [100.0]}), use_container_width=True)
+    weights_0to10 = np.array([10], dtype=int)
+    st.dataframe(pd.DataFrame({"score": feature_display, "weight_0_to_10": [10]}), use_container_width=True)
 else:
-    default_df = pd.DataFrame(
-        {"score": feature_display, "weight_%": [round(100.0 / num_features, 2)] * num_features}
-    )
-
+    default_df = pd.DataFrame({"score": feature_display, "weight_0_to_10": [10] * num_features})
     w_df = st.data_editor(
         default_df,
-        key="weights_table",
+        key="weights_table_0to10",
         use_container_width=True,
         num_rows="fixed",
         column_config={
             "score": st.column_config.TextColumn("Score", disabled=True),
-            "weight_%": st.column_config.NumberColumn("Weight (%)", min_value=0.0, max_value=100.0, step=1.0),
+            "weight_0_to_10": st.column_config.NumberColumn("Weight (0–10)", min_value=0, max_value=10, step=1),
         },
     )
-
-    w_vals = pd.to_numeric(w_df["weight_%"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
-    w_sum = float(w_vals.sum())
-    if w_sum <= 0:
-        st.error("Total weight is 0. Please set at least one weight above 0.")
-        st.stop()
-
-    w_norm = (w_vals / w_sum) * 100.0
-    w_norm = np.round(w_norm, 2)
-    st.caption("Weights are automatically normalized to sum to 100%.")
-    st.dataframe(pd.DataFrame({"score": feature_display, "normalized_weight_%": w_norm}), use_container_width=True)
-
-    weights = (w_norm / 100.0).astype(float)
+    weights_0to10 = pd.to_numeric(w_df["weight_0_to_10"], errors="coerce").fillna(0).to_numpy(dtype=int)
 
 st.markdown("</div>", unsafe_allow_html=True)
 
-# -------------------------
 # Grouping settings
-# - k starts at 0
-# - Optional group size limit toggle
-# -------------------------
 st.markdown("<div class='card'>", unsafe_allow_html=True)
 st.markdown("<div class='h'>Grouping settings</div>", unsafe_allow_html=True)
-
 c1, c2 = st.columns([1, 1])
 with c1:
     k = st.slider("Number of groups (1–10)", 0, 10, 0, key="k_groups")
@@ -320,7 +320,6 @@ with c2:
     cap_pct = 0
     if limit_group_size:
         cap_pct = st.slider("Max % per group", 1, 40, 20, key="cap_pct")
-
 st.markdown("</div>", unsafe_allow_html=True)
 
 if k == 0:
@@ -328,142 +327,45 @@ if k == 0:
     st.stop()
 
 # -------------------------
-# Build model matrix
-# IMPORTANT CHANGE: NO IMPUTATION
-# - We drop students with missing values in ANY selected score feature.
+# ALWAYS recompute from current UI values
 # -------------------------
-model_features = feature_keys
-
-# force numeric (missing becomes NaN)
-for c in model_features:
-    work[c] = pd.to_numeric(work[c], errors="coerce")
-
-X = work[model_features].to_numpy(dtype=float)
-valid_mask = ~np.any(np.isnan(X), axis=1)
-
-excluded = work.loc[~valid_mask, [student_id_col] + ([map_col] if map_col else []) + selected_unit_tests].copy()
-valid_work = work.loc[valid_mask].copy()
-
-n_valid = len(valid_work)
-n_excluded = len(excluded)
-
-if n_excluded > 0:
-    st.warning(f"Excluded {n_excluded} student(s) due to missing selected score(s). (No imputation is used.)")
-
-if n_valid == 0:
-    st.error("All students were excluded (missing selected scores). Upload a cleaner file or select fewer columns.")
-    st.stop()
-
-if k > n_valid:
-    st.error(f"Groups ({k}) cannot be greater than valid students ({n_valid}).")
-    st.stop()
-
-X_valid = valid_work[model_features].to_numpy(dtype=float)
-
-# Standardize (z-score) on valid rows only
-Z = StandardScaler().fit_transform(X_valid)
-
-# Weighted distance for KMeans: multiply by sqrt(weights)
-Z_w = Z * np.sqrt(weights)
-
-# -------------------------
-# KMeans
-# -------------------------
-km = KMeans(n_clusters=k, random_state=0, n_init=10)
-km.fit(Z_w)
-
-centroids = km.cluster_centers_
-dists = np.linalg.norm(Z_w[:, None, :] - centroids[None, :, :], axis=2)
-
-# Optional cap assignment
-if cap_pct == 0:
-    assigned = np.argmin(dists, axis=1)
-else:
-    cap = int(np.ceil((cap_pct / 100.0) * n_valid))
-    cap = max(cap, 1)
-    if k * cap < n_valid:
-        st.error(
-            f"Impossible: {k} groups × max {cap}/group = {k*cap}, but valid class size is {n_valid}. "
-            f"Increase max % or disable the limit."
+with st.spinner("Recalculating…"):
+    try:
+        valid_work, excluded, weights_view, feature_keys = compute_groups(
+            df=work,
+            selected_grade=selected_grade,
+            student_id_col=student_id_col,
+            map_col=map_col,
+            unit_test_cols=unit_test_cols,
+            selected_score_cols=selected_score_cols,
+            k=k,
+            cap_pct=cap_pct,
+            use_map=use_map,
+            selected_unit_tests=selected_unit_tests,
+            weights_0to10=weights_0to10,
         )
+    except Exception as e:
+        st.error(str(e))
         st.stop()
 
-    sorted_idx = np.argsort(np.sort(dists, axis=1)[:, 1] - np.sort(dists, axis=1)[:, 0])
-    remaining = np.array([cap] * k, dtype=int)
-    assigned = np.full(n_valid, -1, dtype=int)
+# Show weights used
+st.markdown("<div class='card'>", unsafe_allow_html=True)
+st.markdown("<div class='h'>Weights used</div>", unsafe_allow_html=True)
+st.dataframe(weights_view, use_container_width=True)
+st.markdown("</div>", unsafe_allow_html=True)
 
-    for i in sorted_idx:
-        for g in np.argsort(dists[i]):
-            if remaining[g] > 0:
-                assigned[i] = g
-                remaining[g] -= 1
-                break
-
-    if np.any(assigned == -1):
-        st.error("Assignment failed unexpectedly. Try disabling the limit or increasing max %.")
-        st.stop()
-
-valid_work["_cluster_internal"] = assigned  # internal only
-
-# Rank clusters so Group 1 = highest
-level_proxy = (Z * weights).sum(axis=1)
-valid_work["_level_proxy"] = level_proxy
-
-order_best = (
-    valid_work.groupby("_cluster_internal")["_level_proxy"]
-    .mean()
-    .sort_values(ascending=False)
-    .index
-    .tolist()
-)
-cluster_to_groupnum = {cl: i + 1 for i, cl in enumerate(order_best)}
-valid_work["Group"] = valid_work["_cluster_internal"].map(cluster_to_groupnum).astype(int)
-valid_work["Group Name"] = valid_work["Group"].apply(lambda g: f"{selected_grade} • Group {g}")
-
-# Influence (MAP vs Unit tests) per student
-row_centroid = centroids[assigned]
-diff = (Z_w - row_centroid)
-feat_contrib = diff ** 2
-total = feat_contrib.sum(axis=1, keepdims=True)
-total[total == 0] = 1.0
-feat_contrib_pct = feat_contrib / total * 100.0
-
-if use_map:
-    map_infl = feat_contrib_pct[:, 0]
-    valid_work["MAP_influence_%"] = np.round(map_infl, 2)
-    valid_work["UnitTests_influence_%"] = np.round(100.0 - map_infl, 2)
-else:
-    valid_work["MAP_influence_%"] = 0.0
-    valid_work["UnitTests_influence_%"] = 100.0
-
-# -------------------------
-# Results (valid students only)
-# -------------------------
+# Results table (no stale results, always current)
 st.markdown("<div class='card'>", unsafe_allow_html=True)
 st.markdown("<div class='h'>Results</div>", unsafe_allow_html=True)
-st.markdown(
-    f"<div class='muted'><b>Valid students:</b> {n_valid} / {n_students_total} &nbsp;&nbsp; "
-    f"<b>Groups:</b> {k} &nbsp;&nbsp; "
-    f"<b>Grade:</b> {selected_grade}</div>",
-    unsafe_allow_html=True,
-)
 
 show_cols = [student_id_col, "Group Name"]
-if use_map:
+if use_map and map_col is not None:
     show_cols += [map_col, "map_percentile"]
 show_cols += selected_unit_tests
-show_cols += ["MAP_influence_%", "UnitTests_influence_%"]
 
 out_table = valid_work[show_cols].sort_values(["Group Name", student_id_col]).reset_index(drop=True)
 st.dataframe(out_table, use_container_width=True, height=560)
 st.markdown("</div>", unsafe_allow_html=True)
-
-# Excluded preview (optional)
-if n_excluded > 0:
-    st.markdown("<div class='card'>", unsafe_allow_html=True)
-    st.markdown("<div class='h'>Excluded (missing selected scores)</div>", unsafe_allow_html=True)
-    st.dataframe(excluded.reset_index(drop=True), use_container_width=True, height=240)
-    st.markdown("</div>", unsafe_allow_html=True)
 
 # Group sizes
 st.markdown("<div class='card'>", unsafe_allow_html=True)
@@ -472,15 +374,21 @@ sizes = valid_work.groupby("Group Name").size().reset_index(name="students")
 st.dataframe(sizes.sort_values("Group Name"), use_container_width=True)
 st.markdown("</div>", unsafe_allow_html=True)
 
-# Export (valid only)
+# Excluded (optional)
+if len(excluded) > 0:
+    st.markdown("<div class='card'>", unsafe_allow_html=True)
+    st.markdown("<div class='h'>Excluded (missing selected scores)</div>", unsafe_allow_html=True)
+    st.dataframe(excluded.reset_index(drop=True), use_container_width=True, height=240)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+# Export
 st.markdown("<div class='card'>", unsafe_allow_html=True)
 st.markdown("<div class='h'>Export</div>", unsafe_allow_html=True)
-download_df = valid_work[show_cols].copy()
 st.download_button(
     "Download CSV (valid students)",
-    data=download_df.to_csv(index=False),
+    data=valid_work[show_cols].to_csv(index=False),
     file_name="students_with_groups.csv",
     mime="text/csv",
-    use_container_width=True
+    use_container_width=True,
 )
 st.markdown("</div>", unsafe_allow_html=True)

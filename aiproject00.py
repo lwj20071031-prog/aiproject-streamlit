@@ -60,15 +60,6 @@ def parse_excel_letters_input(text: str) -> list[int]:
     return indices
 
 
-def to_0_100(x: np.ndarray) -> np.ndarray:
-    x = x.astype(float)
-    mn = np.nanmin(x)
-    mx = np.nanmax(x)
-    if not np.isfinite(mn) or not np.isfinite(mx) or mx == mn:
-        return np.full_like(x, 50.0, dtype=float)
-    return (x - mn) / (mx - mn) * 100.0
-
-
 # -------------------------
 # Robust CSV reader (AUTO header detection)
 # IMPORTANT: does NOT delete/drop ANY columns.
@@ -82,7 +73,6 @@ def _header_score(row: list[str]) -> float:
     uniq = len(set([c.lower() for c in nonempty]))
     score = len(nonempty) + 0.5 * uniq
 
-    # penalize rows that are mostly numbers
     numeric_like = 0
     for c in nonempty:
         if re.fullmatch(r"[-+]?\d+(\.\d+)?", c):
@@ -98,7 +88,6 @@ def read_csv_smart(file_bytes: bytes) -> pd.DataFrame:
     preview = None
     used_enc = None
 
-    # Try common encodings
     for enc in ("utf-8-sig", "utf-8", "cp949", "latin1"):
         try:
             preview = pd.read_csv(
@@ -140,7 +129,6 @@ def read_csv_smart(file_bytes: bytes) -> pd.DataFrame:
         engine="python",
     )
 
-    # IMPORTANT: do NOT drop columns. Just strip header strings.
     df.columns = [str(c).strip() for c in df.columns]
     return df
 
@@ -301,6 +289,7 @@ def compute_groups_partial(df, id_col, selected_score_cols, k, cap_pct, weights_
 
     valid_work["_cluster_internal"] = assigned
 
+    # Weighted normalized performance (z-space) per student (partial scores allowed)
     overall_proxy = np.zeros(n_valid, dtype=float)
     for i in range(n_valid):
         m = mask_valid[i] & (weights > 0)
@@ -312,8 +301,13 @@ def compute_groups_partial(df, id_col, selected_score_cols, k, cap_pct, weights_
             overall_proxy[i] = float(np.sum(wrow * Z_valid[i, m]))
 
     valid_work["_level_proxy"] = overall_proxy
-    valid_work["Overall Score"] = np.round(to_0_100(overall_proxy), 2)
 
+    # Overall Number (rank): 1 = best
+    valid_work["Overall Number"] = (
+        valid_work["_level_proxy"].rank(ascending=False, method="dense").astype(int)
+    )
+
+    # Group 1 = best cluster
     order_best = (
         valid_work.groupby("_cluster_internal")["_level_proxy"]
         .mean()
@@ -372,6 +366,7 @@ if id_letters.strip():
         height=110,
     )
 else:
+    # silent fallback
     lowered = [str(c).strip().lower() for c in df.columns]
     id_col = None
     for cand in ["student_id", "student id", "id", "name", "student name", "student number"]:
@@ -469,10 +464,10 @@ st.subheader("Weights used")
 st.dataframe(weights_view, width="stretch")
 
 st.subheader("Results")
-show_cols = ["Overall Score", id_col, "Group Name"] + selected_score_cols
+show_cols = ["Overall Number", id_col, "Group Name"] + selected_score_cols
 out_table = (
     valid_work[show_cols]
-    .sort_values(["Overall Score", "Group Name", id_col], ascending=[False, True, True])
+    .sort_values(["Overall Number", "Group Name", id_col], ascending=[True, True, True])
     .reset_index(drop=True)
 )
 st.dataframe(out_table, width="stretch", height=560)
@@ -485,6 +480,6 @@ st.subheader("Export")
 st.download_button(
     "Download CSV (valid students)",
     data=out_table.to_csv(index=False),
-    file_name="students_with_groups_overall_score.csv",
+    file_name="students_with_groups_overall_number.csv",
     mime="text/csv",
 )

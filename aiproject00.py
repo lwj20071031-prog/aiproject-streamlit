@@ -61,8 +61,7 @@ def parse_excel_letters_input(text: str) -> list[int]:
 
 
 # -------------------------
-# Robust CSV reader (AUTO header detection)
-# Does NOT delete/drop any columns.
+# Smart CSV reader (auto header row)
 # -------------------------
 def _header_score(row: list[str]) -> float:
     cells = [("" if x is None else str(x).strip()) for x in row]
@@ -133,16 +132,10 @@ def read_csv_smart(file_bytes: bytes) -> pd.DataFrame:
 
 
 # -------------------------
-# Core math:
-# 1) For each selected test: normalize that test to 0..100 (within this file) using min-max, ignoring blanks
-# 2) For each student: compute weighted average across available tests (weights re-normalized per student)
-# 3) Normalize the composite to 0..100 within this file (relative ranking score)
+# Normalization: per test -> 0..100 (min-max), ignore blanks
+# If a test column has no variance, all non-missing become 50.
 # -------------------------
 def minmax_0_100_by_column(X: np.ndarray) -> np.ndarray:
-    """
-    Column-wise min-max scaling to 0..100 ignoring NaN.
-    If a column has no variance (max == min), all non-missing become 50.
-    """
     S = np.full_like(X, np.nan, dtype=float)
     d = X.shape[1]
     for j in range(d):
@@ -159,190 +152,121 @@ def minmax_0_100_by_column(X: np.ndarray) -> np.ndarray:
     return S
 
 
-def normalize_0_100_minmax(v: np.ndarray) -> np.ndarray:
-    v = np.asarray(v, dtype=float)
-    mn = np.nanmin(v)
-    mx = np.nanmax(v)
-    if not np.isfinite(mn) or not np.isfinite(mx) or mx == mn:
-        return np.full_like(v, 50.0, dtype=float)
-    return (v - mn) / (mx - mn) * 100.0
-
-
-def masked_weighted_dist2(S: np.ndarray, mask: np.ndarray, C: np.ndarray, w: np.ndarray) -> np.ndarray:
-    """
-    Weighted squared distance for KMeans, ignoring missing dims per student.
-    We normalize by sum of weights over available dims.
-    """
-    n, d = S.shape
-    k = C.shape[0]
-    dist2 = np.full((n, k), np.inf, dtype=float)
-    w = np.clip(w.astype(float), 0.0, None)
-
-    for i in range(n):
-        m = mask[i]
-        wsum = float(np.sum(w[m]))
-        if wsum <= 0:
-            continue
-        for g in range(k):
-            diff = S[i, m] - C[g, m]
-            dist2[i, g] = float(np.sum(w[m] * (diff ** 2)) / wsum)
-
-    return dist2
-
-
-def masked_kmeans(S: np.ndarray, mask: np.ndarray, weights: np.ndarray, k: int, max_iter: int = 50, seed: int = 0):
-    """
-    Simple KMeans variant that handles missing values by ignoring missing dimensions.
-    Uses weighted distances.
-    """
-    rng = np.random.default_rng(seed)
-    n, d = S.shape
-
-    init_idx = rng.choice(n, size=k, replace=(n < k))
-    C = np.zeros((k, d), dtype=float)
-    for g, idx in enumerate(init_idx):
-        m = mask[idx]
-        C[g, m] = S[idx, m]
-
-    labels = np.full(n, -1, dtype=int)
-
-    for _ in range(max_iter):
-        dist2 = masked_weighted_dist2(S, mask, C, weights)
-        new_labels = np.argmin(dist2, axis=1)
-        if np.array_equal(new_labels, labels):
-            break
-        labels = new_labels
-
-        # update centroids
-        for g in range(k):
-            idxs = np.where(labels == g)[0]
-            if len(idxs) == 0:
-                ridx = rng.integers(0, n)
-                C[g, :] = 0.0
-                m = mask[ridx]
-                C[g, m] = S[ridx, m]
-                continue
-
-            for j in range(d):
-                mj = mask[idxs, j]
-                if np.any(mj):
-                    C[g, j] = float(np.mean(S[idxs[mj], j]))
-                else:
-                    C[g, j] = 0.0
-
-    return labels, C
-
-
-def compute_groups(df, id_col, score_cols, k, cap_pct, weights_0to10):
+# -------------------------
+# Compute Overall Score + Rank-based grouping
+# Overall Score = sum( (w/10) * normalized_test_score )
+# Missing scores contribute 0 (not renormalized).
+# -------------------------
+def compute_rank_groups(
+    df: pd.DataFrame,
+    id_col: str,
+    score_cols: list[str],
+    weights_0to10: np.ndarray,
+    k: int,
+    cap_pct: int,
+):
     work = df.copy()
 
-    # numeric conversion
+    # numeric conversion for selected score columns
     for c in score_cols:
         work[c] = pd.to_numeric(work[c], errors="coerce")
 
     X = work[score_cols].to_numpy(dtype=float)
+    S = minmax_0_100_by_column(X)  # normalized per test, NaN where missing
 
-    # 1) per-test normalize to 0..100 (handles “scores up to 200” etc.)
-    S = minmax_0_100_by_column(X)  # NxD, NaN where missing
-
-    raw = np.array(weights_0to10, dtype=float)
-    if raw.shape[0] != len(score_cols):
+    w010 = np.array(weights_0to10, dtype=float)
+    if w010.shape[0] != len(score_cols):
         raise ValueError("Weights do not match selected score columns.")
-    raw = np.clip(raw, 0.0, None)
-    if raw.sum() <= 0:
-        raise ValueError("All weights are 0. Set at least one weight above 0.")
 
-    weights = (raw / raw.sum()).astype(float)
-    weights_view = pd.DataFrame({"score": score_cols, "final_weight_%": np.round(weights * 100.0, 2)})
+    # convert 0..10 -> 0.0..1.0
+    w = np.clip(w010, 0.0, 10.0) / 10.0
 
-    # valid student = has at least one available test with weight > 0
-    mask = ~np.isnan(S)
-    usable_w = (weights > 0)
-    row_has_any = np.any(mask[:, usable_w], axis=1) if np.any(usable_w) else np.zeros(len(work), dtype=bool)
+    if np.sum(w) <= 0:
+        raise ValueError("All weights are 0. Set at least one test weight above 0.")
 
-    excluded = work.loc[~row_has_any, [id_col] + score_cols].copy()
-    valid_work = work.loc[row_has_any].copy()
+    # IMPORTANT: do NOT renormalize weights (this is what you wanted)
+    # If total weight > 1, overall score could exceed 100, so we forbid it to match your meaning.
+    total_weight = float(np.sum(w))
+    if total_weight > 1.0 + 1e-9:
+        raise ValueError(
+            f"Total weight is {total_weight:.2f} (> 1.00). "
+            f"Reduce weights so total is <= 1.00 (100%)."
+        )
 
-    S_valid = S[row_has_any]
-    mask_valid = mask[row_has_any]
-    n_valid = len(valid_work)
+    # Missing scores contribute 0 (NOT renormalized)
+    S0 = np.nan_to_num(S, nan=0.0)
+    overall = S0 @ w  # 0..100 * fraction => 0..100*sum(w) <= 100
+    work["Overall Score"] = np.round(overall, 2)
 
-    if n_valid == 0:
+    # Excluded: students with no usable score values for any weighted test
+    has_any_value = np.any(~np.isnan(S) & (w[None, :] > 0), axis=1)
+    excluded = work.loc[~has_any_value, [id_col] + score_cols].copy()
+    valid_work = work.loc[has_any_value].copy()
+
+    if len(valid_work) == 0:
         raise ValueError("No students have any usable selected scores.")
-    if k > n_valid:
-        raise ValueError(f"Number of groups ({k}) cannot exceed valid students ({n_valid}).")
 
-    # 2) composite per student (whole bundle), weights re-normalized per student over available tests
-    composite = np.full(n_valid, np.nan, dtype=float)
-    for i in range(n_valid):
-        m = mask_valid[i] & (weights > 0)
-        wsum = float(np.sum(weights[m]))
-        if wsum <= 0:
-            continue
-        wrow = weights[m] / wsum
-        composite[i] = float(np.sum(wrow * S_valid[i, m]))
+    if k > len(valid_work):
+        raise ValueError(f"Number of groups ({k}) cannot exceed valid students ({len(valid_work)}).")
 
-    # 3) overall score = relative within file/class using min-max on composite
-    overall_score = normalize_0_100_minmax(composite)
-    valid_work["Overall Score"] = np.round(overall_score, 2)
-    valid_work["_level_proxy"] = overall_score  # used for group ranking
+    # Sort by Overall Score (best first)
+    valid_work = valid_work.sort_values(["Overall Score", id_col], ascending=[False, True]).reset_index(drop=True)
 
-    # clustering on the same normalized-per-test space (S_valid)
-    labels, C = masked_kmeans(S_valid, mask_valid, weights, k=k, max_iter=50, seed=0)
-    dist2 = masked_weighted_dist2(S_valid, mask_valid, C, weights)
-    dists = np.sqrt(np.maximum(dist2, 0.0))
-
-    cap_note = None
-    if cap_pct == 0:
-        assigned = labels
-    else:
-        cap = int(np.ceil((cap_pct / 100.0) * n_valid))
-        cap = max(cap, 1)
-
-        min_cap = int(np.ceil(n_valid / k))
-        if cap < min_cap:
-            cap = min_cap
-            cap_note = (
-                f"Max % per group was too small to fit all valid students. "
-                f"Auto-adjusted to at least {int(np.ceil(100 * cap / n_valid))}%."
+    # Optional cap check (max % per group)
+    if cap_pct and cap_pct > 0:
+        max_size = int(np.ceil((cap_pct / 100.0) * len(valid_work)))
+        max_size = max(max_size, 1)
+        # If cap makes it impossible to place everyone, error clearly
+        if max_size * k < len(valid_work):
+            raise ValueError(
+                f"Impossible: {k} groups × max {max_size}/group = {max_size*k}, "
+                f"but you have {len(valid_work)} valid students. Increase max % or groups."
             )
 
-        sorted_d = np.sort(dists, axis=1)
-        margin = sorted_d[:, 1] - sorted_d[:, 0] if k >= 2 else np.full(n_valid, 0.0)
-        sorted_idx = np.argsort(-margin)
+    # Equal split by rank
+    n = len(valid_work)
+    base = n // k
+    rem = n % k
+    sizes = [(base + 1 if i < rem else base) for i in range(k)]  # top groups can get +1
 
-        remaining = np.array([cap] * k, dtype=int)
-        assigned = np.full(n_valid, -1, dtype=int)
+    # If cap is enabled, ensure each size <= max_size
+    if cap_pct and cap_pct > 0:
+        max_size = int(np.ceil((cap_pct / 100.0) * n))
+        max_size = max(max_size, 1)
+        if any(s > max_size for s in sizes):
+            raise ValueError(
+                "Your max % per group is too small for an equal rank split. "
+                "Increase max % or increase number of groups."
+            )
 
-        for i in sorted_idx:
-            for g in np.argsort(dists[i]):
-                if remaining[g] > 0:
-                    assigned[i] = g
-                    remaining[g] -= 1
-                    break
+    groups = []
+    start = 0
+    for gi, sz in enumerate(sizes, start=1):
+        end = start + sz
+        groups.extend([gi] * sz)
+        start = end
 
-        if np.any(assigned == -1):
-            raise ValueError("Assignment failed. Disable cap or increase max %.")
-
-    valid_work["_cluster_internal"] = assigned
-
-    # Group numbering: Group 1 = best mean Overall Score
-    order_best = (
-        valid_work.groupby("_cluster_internal")["_level_proxy"]
-        .mean()
-        .sort_values(ascending=False)
-        .index
-        .tolist()
-    )
-    cluster_to_groupnum = {cl: i + 1 for i, cl in enumerate(order_best)}
-    valid_work["Group"] = valid_work["_cluster_internal"].map(cluster_to_groupnum).astype(int)
+    valid_work["Group"] = groups
     valid_work["Group Name"] = valid_work["Group"].apply(lambda g: f"Group {g}")
 
-    return valid_work, excluded, weights_view, cap_note
+    # Also provide an overall number (rank) if you want it:
+    valid_work["Overall Number"] = np.arange(1, len(valid_work) + 1)
+
+    # Weights view (what % of the final decision each test controls)
+    weights_view = pd.DataFrame(
+        {
+            "score": score_cols,
+            "weight_0_to_10": w010.astype(int),
+            "weight_fraction": np.round(w, 2),
+            "weight_%": np.round(w * 100.0, 1),
+        }
+    )
+
+    return valid_work, excluded, weights_view
 
 
 # -------------------------
-# App
+# App UI
 # -------------------------
 st.set_page_config(page_title="WAB Classroom Assignment Program", layout="wide")
 st.title("WAB Classroom Assignment Program")
@@ -355,7 +279,7 @@ if uploaded is None:
 file_bytes = uploaded.getvalue()
 file_sig = (len(file_bytes), hash(file_bytes[:5000]))
 
-# Reset widgets when file changes (so it doesn't keep old selections)
+# Reset widget state when file changes
 if st.session_state.get("_file_sig") != file_sig:
     st.session_state["_file_sig"] = file_sig
     for kk in list(st.session_state.keys()):
@@ -379,13 +303,9 @@ if id_letters.strip():
         st.error(f"Column out of range: {index_to_excel_col(idx)} (file has {len(df.columns)} columns)")
         st.stop()
     id_col = df.columns[idx]
-    st.dataframe(
-        pd.DataFrame({"Excel": [index_to_excel_col(idx)], "Column title": [id_col]}),
-        width="stretch",
-        height=110,
-    )
+    st.dataframe(pd.DataFrame({"Excel": [index_to_excel_col(idx)], "Column title": [id_col]}), width="stretch", height=110)
 else:
-    # fallback: create an id column silently
+    # fallback silently
     df = df.copy()
     df["student_id"] = [f"S{i+1:03d}" for i in range(len(df))]
     id_col = "student_id"
@@ -405,7 +325,6 @@ try:
                 raise ValueError(f"Column out of range: {index_to_excel_col(i)} (file has {len(df.columns)} columns)")
         selected_score_cols = [df.columns[i] for i in idxs]
 
-        # If user accidentally included id column in scores, remove it (without deleting from df)
         if id_col in selected_score_cols:
             selected_score_cols = [c for c in selected_score_cols if c != id_col]
 
@@ -423,33 +342,33 @@ if not selected_score_cols:
     st.info("Type at least 1 Excel column letter to continue.")
     st.stop()
 
-# Weights per selected score (0-10)
+# Weights per selected score (0-10 each)
 st.subheader("Weights (0–10 per selected score)")
-st.caption("0 = off • 10 = strongest (normalized automatically)")
+st.caption("0 = off • 10 = strongest • Total must be ≤ 10 (100%)")
+
 weights_key = f"weights_{abs(hash(tuple(selected_score_cols))) % 10**9}"
 
 if len(selected_score_cols) == 1:
-    weights_0to10 = np.array([10], dtype=int)
-    st.dataframe(
-        pd.DataFrame({"score": selected_score_cols, "weight_0_to_10": [10]}),
-        width="stretch",
-        height=110,
-    )
+    default_df = pd.DataFrame({"score": selected_score_cols, "weight_0_to_10": [10]})
 else:
-    default_df = pd.DataFrame({"score": selected_score_cols, "weight_0_to_10": [10] * len(selected_score_cols)})
-    w_df = st.data_editor(
-        default_df,
-        key=weights_key,
-        width="stretch",
-        num_rows="fixed",
-        column_config={
-            "score": st.column_config.TextColumn("Score", disabled=True),
-            "weight_0_to_10": st.column_config.NumberColumn("Weight (0–10)", min_value=0, max_value=10, step=1),
-        },
-    )
-    weights_0to10 = pd.to_numeric(w_df["weight_0_to_10"], errors="coerce").fillna(0).to_numpy(dtype=int)
+    default_df = pd.DataFrame({"score": selected_score_cols, "weight_0_to_10": [0] * len(selected_score_cols)})
 
-# Grouping settings
+w_df = st.data_editor(
+    default_df,
+    key=weights_key,
+    width="stretch",
+    num_rows="fixed",
+    column_config={
+        "score": st.column_config.TextColumn("Score", disabled=True),
+        "weight_0_to_10": st.column_config.NumberColumn("Weight (0–10)", min_value=0, max_value=10, step=1),
+    },
+)
+
+weights_0to10 = pd.to_numeric(w_df["weight_0_to_10"], errors="coerce").fillna(0).to_numpy(dtype=int)
+total010 = int(np.sum(weights_0to10))
+st.write(f"Total weight: **{total010}/10**")
+
+# Grouping
 st.subheader("Grouping settings")
 k = st.slider("Number of groups (1–10)", 1, 10, 3, key="k_groups")
 limit_group_size = st.checkbox("Limit max group size", value=False, key="limit_group_size")
@@ -457,35 +376,28 @@ cap_pct = st.slider("Max % per group", 1, 40, 20, key="cap_pct") if limit_group_
 
 try:
     with st.spinner("Recalculating…"):
-        valid_work, excluded, weights_view, cap_note = compute_groups(
+        valid_work, excluded, weights_view = compute_rank_groups(
             df=df,
             id_col=id_col,
             score_cols=selected_score_cols,
+            weights_0to10=weights_0to10,
             k=k,
             cap_pct=cap_pct,
-            weights_0to10=weights_0to10,
         )
 except Exception as e:
     st.error(str(e))
     st.stop()
 
-if cap_note:
-    st.warning(cap_note)
-
 st.subheader("Weights used")
 st.dataframe(weights_view, width="stretch")
 
 st.subheader("Results")
-show_cols = ["Overall Score", id_col, "Group Name"] + selected_score_cols
-out_table = (
-    valid_work[show_cols]
-    .sort_values(["Overall Score", "Group Name", id_col], ascending=[False, True, True])
-    .reset_index(drop=True)
-)
+show_cols = ["Overall Score", "Overall Number", id_col, "Group Name"] + selected_score_cols
+out_table = valid_work[show_cols].reset_index(drop=True)
 st.dataframe(out_table, width="stretch", height=560)
 
 if len(excluded) > 0:
-    with st.expander(f"Students excluded (no usable selected scores): {len(excluded)}"):
+    with st.expander(f"Excluded students (no usable selected scores): {len(excluded)}"):
         st.dataframe(excluded.reset_index(drop=True), width="stretch", height=240)
 
 st.subheader("Export")

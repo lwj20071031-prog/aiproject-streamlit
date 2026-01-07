@@ -173,7 +173,8 @@ def assign_groups_by_rank(df_sorted: pd.DataFrame, k: int) -> pd.Series:
 # Compute results with:
 # - per-test min-max normalization to 0..100
 # - weights normalized to 100% (10 & 5 -> 66.67% & 33.33%)
-# - missing scores are NEGLECTED per student (re-normalize weights per student)
+# - missing scores NEGLECTED per student (renormalize weights per student)
+# - final Overall Score re-normalized across students so BEST=100, WORST=0
 # -------------------------
 def compute_results(
     df: pd.DataFrame,
@@ -204,26 +205,29 @@ def compute_results(
     # normalize weights to sum to 1 (100%)
     w = w010 / w010.sum()
 
-    # For each student, ignore missing tests by renormalizing weights across present tests
+    # per-student: ignore missing tests by renormalizing weights across present tests
     present = ~np.isnan(S)  # NxD
     w_present_sum = (present * w).sum(axis=1)  # N
 
     safe_denom = np.where(w_present_sum == 0, np.nan, w_present_sum)  # avoid divide by 0
     w_student = (present * w) / safe_denom[:, None]  # NxD
 
-    # overall score: weighted sum of normalized scores (0..100), ignoring blanks
-    overall = np.nansum(S * w_student, axis=1)  # N, NaN if no scores present
-    work["Overall Score"] = np.round(overall, 2)
+    # weighted overall in 0..100 scale (based on per-test normalized scores)
+    overall_raw = np.nansum(S * w_student, axis=1)  # NaN if no scores present
 
-    # Overall Number: 1 = best, only among students who have an overall score
-    scored_mask = ~np.isnan(overall)
-    overall_scored = overall[scored_mask]
-    order = np.argsort(-overall_scored, kind="mergesort")
-    rank = np.empty_like(order)
-    rank[order] = np.arange(1, len(overall_scored) + 1)
+    # final normalization across students: BEST=100, WORST=0
+    scored_mask = ~np.isnan(overall_raw)
+    final = np.full_like(overall_raw, np.nan, dtype=float)
+    if np.any(scored_mask):
+        vals = overall_raw[scored_mask].astype(float)
+        vmin = float(np.min(vals))
+        vmax = float(np.max(vals))
+        if vmax == vmin:
+            final[scored_mask] = 50.0
+        else:
+            final[scored_mask] = (vals - vmin) / (vmax - vmin) * 100.0
 
-    work["Overall Number"] = np.nan
-    work.loc[scored_mask, "Overall Number"] = rank.astype(int)
+    work["Overall Score"] = np.round(final, 2)
 
     # sort results: scored first, best to worst
     work_sorted = work.copy()
@@ -370,7 +374,7 @@ st.subheader("Weights used (normalized to 100%)")
 st.dataframe(weights_view, width="stretch")
 
 st.subheader("Results")
-show_cols = ["Overall Score", "Overall Number", id_col, "Group Name"] + score_cols
+show_cols = ["Overall Score", id_col, "Group Name"] + score_cols
 st.dataframe(results[show_cols].reset_index(drop=True), height=560, width="stretch")
 
 st.download_button(

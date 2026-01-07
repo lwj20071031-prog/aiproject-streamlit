@@ -152,14 +152,11 @@ def minmax_0_100_by_column(X: np.ndarray) -> np.ndarray:
 
 
 # -------------------------
-# Rank-based grouping (no KMeans)
-# Best scores go to Group 1.
+# Split into groups by rank (best -> Group 1)
 # -------------------------
 def assign_groups_by_rank(df_sorted: pd.DataFrame, k: int) -> pd.Series:
     n = len(df_sorted)
-    if k < 1:
-        k = 1
-    k = min(k, n)
+    k = max(1, min(int(k), n))
 
     base = n // k
     rem = n % k
@@ -173,58 +170,91 @@ def assign_groups_by_rank(df_sorted: pd.DataFrame, k: int) -> pd.Series:
 
 
 # -------------------------
-# Compute Overall Score (ABSOLUTE weights)
-# weight input 0..10 -> fraction 0..1 by dividing by 10
-# Overall Score = sum( normalized_score_0..100 * weight_fraction )
-# Missing score contributes 0 for that test.
-# Then clip to 0..100.
+# Compute results with:
+# - per-test min-max normalization to 0..100
+# - weights normalized to 100% (10 & 5 -> 66.67% & 33.33%)
+# - missing scores are NEGLECTED per student (re-normalize weights per student)
 # -------------------------
-def compute_results(df: pd.DataFrame, id_col: str, score_cols: list[str], weights_0to10: np.ndarray, k: int):
+def compute_results(
+    df: pd.DataFrame,
+    id_col: str,
+    score_cols: list[str],
+    weights_0to10: np.ndarray,
+    k: int,
+):
     work = df.copy()
 
+    # numeric conversion
     for c in score_cols:
         work[c] = pd.to_numeric(work[c], errors="coerce")
 
     X = work[score_cols].to_numpy(dtype=float)
-    S = minmax_0_100_by_column(X)  # NxD (NaN where missing)
+
+    # normalize each test column to 0..100
+    S = minmax_0_100_by_column(X)  # NxD, NaN where missing
 
     w010 = np.array(weights_0to10, dtype=float)
     if w010.shape[0] != len(score_cols):
         raise ValueError("Weights do not match selected score columns.")
 
-    wfrac = np.clip(w010, 0.0, 10.0) / 10.0  # 0..1
-
-    if float(np.sum(wfrac)) <= 0:
+    w010 = np.clip(w010, 0.0, 10.0)
+    if float(w010.sum()) <= 0:
         raise ValueError("All weights are 0. Set at least one score weight above 0.")
 
-    # Missing contributes 0 (keeps absolute-weight meaning: 0.5*100=50)
-    S0 = np.nan_to_num(S, nan=0.0)
-    overall = S0 @ wfrac
+    # normalize weights to sum to 1 (100%)
+    w = w010 / w010.sum()
 
-    # keep clean 0..100 scale
-    overall = np.clip(overall, 0.0, 100.0)
+    # For each student, ignore missing tests by renormalizing weights across present tests
+    present = ~np.isnan(S)  # NxD
+    w_present_sum = (present * w).sum(axis=1)  # N
 
+    safe_denom = np.where(w_present_sum == 0, np.nan, w_present_sum)  # avoid divide by 0
+    w_student = (present * w) / safe_denom[:, None]  # NxD
+
+    # overall score: weighted sum of normalized scores (0..100), ignoring blanks
+    overall = np.nansum(S * w_student, axis=1)  # N, NaN if no scores present
     work["Overall Score"] = np.round(overall, 2)
 
-    # Overall Number: 1 = best
-    order = np.argsort(-overall, kind="mergesort")
+    # Overall Number: 1 = best, only among students who have an overall score
+    scored_mask = ~np.isnan(overall)
+    overall_scored = overall[scored_mask]
+    order = np.argsort(-overall_scored, kind="mergesort")
     rank = np.empty_like(order)
-    rank[order] = np.arange(1, len(overall) + 1)
-    work["Overall Number"] = rank.astype(int)
+    rank[order] = np.arange(1, len(overall_scored) + 1)
 
-    # sort for display/grouping
-    work_sorted = work.sort_values(["Overall Score", id_col], ascending=[False, True]).copy()
+    work["Overall Number"] = np.nan
+    work.loc[scored_mask, "Overall Number"] = rank.astype(int)
 
-    # groups by rank
-    work_sorted["Group"] = assign_groups_by_rank(work_sorted, k)
-    work_sorted["Group Name"] = work_sorted["Group"].apply(lambda g: f"Group {g}")
+    # sort results: scored first, best to worst
+    work_sorted = work.copy()
+    work_sorted["_scored"] = scored_mask.astype(int)
+    work_sorted = work_sorted.sort_values(
+        by=["_scored", "Overall Score", id_col],
+        ascending=[False, False, True],
+    ).copy()
+    work_sorted.drop(columns=["_scored"], inplace=True)
 
+    # group assignment only for scored students
+    scored_sorted = work_sorted[scored_mask].copy()
+    if len(scored_sorted) > 0:
+        scored_sorted["Group"] = assign_groups_by_rank(scored_sorted, k)
+        scored_sorted["Group Name"] = scored_sorted["Group"].apply(lambda g: f"Group {g}")
+    else:
+        scored_sorted["Group"] = []
+        scored_sorted["Group Name"] = []
+
+    # merge back
+    work_sorted["Group"] = np.nan
+    work_sorted["Group Name"] = np.nan
+    work_sorted.loc[scored_sorted.index, "Group"] = scored_sorted["Group"].astype(int)
+    work_sorted.loc[scored_sorted.index, "Group Name"] = scored_sorted["Group Name"]
+
+    # weights view (global normalized weights)
     weights_view = pd.DataFrame(
         {
             "score": score_cols,
             "weight_0_to_10": w010.astype(int),
-            "weight_fraction": np.round(wfrac, 2),
-            "weight_%": np.round(wfrac * 100.0, 1),
+            "weight_%": np.round(w * 100.0, 2),
         }
     )
 
@@ -237,14 +267,6 @@ def compute_results(df: pd.DataFrame, id_col: str, score_cols: list[str], weight
 st.set_page_config(page_title="WAB Classroom Assignment Program", layout="wide")
 st.title("WAB Classroom Assignment Program")
 
-# Reset button (clears UI state)
-col_a, col_b = st.columns([1, 5])
-with col_a:
-    if st.button("Reset", use_container_width=True):
-        for kk in list(st.session_state.keys()):
-            st.session_state.pop(kk, None)
-        st.rerun()
-
 uploaded = st.file_uploader("Upload CSV", type=["csv"])
 if uploaded is None:
     st.stop()
@@ -252,7 +274,7 @@ if uploaded is None:
 file_bytes = uploaded.getvalue()
 file_sig = (len(file_bytes), hash(file_bytes[:5000]))
 
-# reset key parts when file changes (prevents “old clicks” showing)
+# reset UI state when file changes
 if st.session_state.get("_file_sig") != file_sig:
     st.session_state["_file_sig"] = file_sig
     for kk in list(st.session_state.keys()):
@@ -261,13 +283,13 @@ if st.session_state.get("_file_sig") != file_sig:
 
 df = read_csv_smart(file_bytes)
 
-# Show a full column map so Excel letters never feel “off”
+# Column map so users can verify letters
 colmap = pd.DataFrame(
     {"Excel": [index_to_excel_col(i) for i in range(len(df.columns))], "Column title": list(df.columns)}
 )
 st.dataframe(colmap, height=260, width="stretch")
 
-# Student name column
+# Name column (Excel letter)
 st.subheader("Student name column")
 id_letters = st.text_input("Type ONE Excel letter (example: E)", value="", key="id_letters_input")
 
@@ -282,25 +304,24 @@ if id_letters.strip():
         st.stop()
     id_col = df.columns[idx]
 else:
-    # silent fallback
+    # silent fallback (no message)
     df = df.copy()
     df["student_id"] = [f"S{i+1:03d}" for i in range(len(df))]
     id_col = "student_id"
 
-# Score columns
+# Score columns (Excel letters)
 st.subheader("Score columns")
 score_letters = st.text_input("Type Excel letters (example: A B C)", value="", key="score_letters_input")
 
-idxs = []
 try:
     idxs = parse_excel_letters_input(score_letters)
 except Exception as e:
     st.error(str(e))
+    st.stop()
 
 if not idxs:
     st.stop()
 
-# map letters -> columns
 bad = [i for i in idxs if i < 0 or i >= len(df.columns)]
 if bad:
     st.error(f"Out of range: {', '.join(index_to_excel_col(i) for i in bad)}")
@@ -311,7 +332,7 @@ if not score_cols:
     st.error("No valid score columns selected (don’t include the name column).")
     st.stop()
 
-# Weights table (default starts at 0)
+# Weights (0-10 each) -> normalized into 100% automatically
 st.subheader("Weights (0–10 each)")
 weights_key = f"weights_{abs(hash(tuple(score_cols))) % 10**9}"
 default_df = pd.DataFrame({"score": score_cols, "weight_0_to_10": [0] * len(score_cols)})
@@ -328,18 +349,24 @@ w_df = st.data_editor(
 )
 weights_0to10 = pd.to_numeric(w_df["weight_0_to_10"], errors="coerce").fillna(0).to_numpy(dtype=int)
 
-# Groups
+# Group count
 st.subheader("Grouping")
 k = st.slider("Number of groups", 1, 10, 3, key="k_groups")
 
 # Compute + display
 try:
-    results, weights_view = compute_results(df, id_col=id_col, score_cols=score_cols, weights_0to10=weights_0to10, k=k)
+    results, weights_view = compute_results(
+        df=df,
+        id_col=id_col,
+        score_cols=score_cols,
+        weights_0to10=weights_0to10,
+        k=k,
+    )
 except Exception as e:
     st.error(str(e))
     st.stop()
 
-st.subheader("Weights used")
+st.subheader("Weights used (normalized to 100%)")
 st.dataframe(weights_view, width="stretch")
 
 st.subheader("Results")

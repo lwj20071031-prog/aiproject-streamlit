@@ -62,12 +62,17 @@ def parse_excel_letters_input(text: str) -> list[int]:
 
 # -------------------------
 # Overall score conversion (0–100)
-# Use sigmoid so average ~50, avoids “max becomes 100” effect.
+# RELATIVE within the uploaded file: min-max normalization
+# Best proxy => 100, worst proxy => 0
 # -------------------------
-def proxy_to_0_100_sigmoid(proxy: np.ndarray) -> np.ndarray:
+def proxy_to_0_100_minmax(proxy: np.ndarray) -> np.ndarray:
     p = np.asarray(proxy, dtype=float)
-    p = np.clip(p, -6, 6)  # prevents exp overflow; still maps to ~0.25..99.75
-    return 100.0 / (1.0 + np.exp(-p))
+    mn = np.nanmin(p)
+    mx = np.nanmax(p)
+    if not np.isfinite(mn) or not np.isfinite(mx) or mx == mn:
+        # if everyone ties, give all 50
+        return np.full_like(p, 50.0, dtype=float)
+    return (p - mn) / (mx - mn) * 100.0
 
 
 # -------------------------
@@ -175,7 +180,7 @@ def standardize_with_nans(X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 def masked_weighted_dist2(Z: np.ndarray, mask: np.ndarray, C: np.ndarray, w: np.ndarray) -> np.ndarray:
     """
     Weighted squared distance, ignoring missing dims per student.
-    We also normalize by sum of weights over available dims so distance scale stays fair.
+    Normalize by sum of weights over available dims for fairness.
     """
     n, d = Z.shape
     k = C.shape[0]
@@ -319,7 +324,7 @@ def compute_groups_partial(df, id_col, selected_score_cols, k, cap_pct, weights_
     valid_work["_cluster_internal"] = assigned
 
     # Weighted normalized performance per student, allowing partial scores:
-    # we renormalize weights *per student* over the tests that are present
+    # renormalize weights per student over the tests that are present
     overall_proxy = np.zeros(n_valid, dtype=float)
     for i in range(n_valid):
         m = mask_valid[i] & (weights > 0)
@@ -332,8 +337,8 @@ def compute_groups_partial(df, id_col, selected_score_cols, k, cap_pct, weights_
 
     valid_work["_level_proxy"] = overall_proxy
 
-    # Overall Score (0–100) AFTER weighting: sigmoid mapping
-    valid_work["Overall Score"] = np.round(proxy_to_0_100_sigmoid(overall_proxy), 2)
+    # Overall Score (0–100) AFTER weighting: min-max within this file
+    valid_work["Overall Score"] = np.round(proxy_to_0_100_minmax(overall_proxy), 2)
 
     # Group numbering: Group 1 = best mean proxy
     order_best = (

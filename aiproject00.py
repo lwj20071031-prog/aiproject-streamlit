@@ -61,6 +61,18 @@ def parse_excel_letters_input(text: str) -> list[int]:
 
 
 # -------------------------
+# Overall score conversion (0–100)
+# We use percentile rank (stable) instead of min-max.
+# Best student gets 100, worst gets ~0.
+# -------------------------
+def proxy_to_0_100_percentile(proxy: np.ndarray) -> np.ndarray:
+    s = pd.Series(proxy)
+    # pct=True gives [0,1]; rank higher proxy => higher percentile
+    pct = s.rank(method="average", pct=True, ascending=True)  # ascending=True: bigger proxy => bigger pct
+    return (pct * 100.0).to_numpy(dtype=float)
+
+
+# -------------------------
 # Robust CSV reader (AUTO header detection)
 # IMPORTANT: does NOT delete/drop ANY columns.
 # -------------------------
@@ -134,7 +146,7 @@ def read_csv_smart(file_bytes: bytes) -> pd.DataFrame:
 
 
 # -------------------------
-# Partial-score normalize + masked kmeans
+# Partial-score normalization + masked kmeans
 # -------------------------
 def standardize_with_nans(X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     mask = ~np.isnan(X)
@@ -302,12 +314,10 @@ def compute_groups_partial(df, id_col, selected_score_cols, k, cap_pct, weights_
 
     valid_work["_level_proxy"] = overall_proxy
 
-    # Overall Number (rank): 1 = best
-    valid_work["Overall Number"] = (
-        valid_work["_level_proxy"].rank(ascending=False, method="dense").astype(int)
-    )
+    # Overall Score: percentile-based 0–100
+    valid_work["Overall Score"] = np.round(proxy_to_0_100_percentile(overall_proxy), 2)
 
-    # Group 1 = best cluster
+    # Group 1 = best cluster (by mean proxy)
     order_best = (
         valid_work.groupby("_cluster_internal")["_level_proxy"]
         .mean()
@@ -366,7 +376,6 @@ if id_letters.strip():
         height=110,
     )
 else:
-    # silent fallback
     lowered = [str(c).strip().lower() for c in df.columns]
     id_col = None
     for cand in ["student_id", "student id", "id", "name", "student name", "student number"]:
@@ -464,10 +473,10 @@ st.subheader("Weights used")
 st.dataframe(weights_view, width="stretch")
 
 st.subheader("Results")
-show_cols = ["Overall Number", id_col, "Group Name"] + selected_score_cols
+show_cols = ["Overall Score", id_col, "Group Name"] + selected_score_cols
 out_table = (
     valid_work[show_cols]
-    .sort_values(["Overall Number", "Group Name", id_col], ascending=[True, True, True])
+    .sort_values(["Overall Score", "Group Name", id_col], ascending=[False, True, True])
     .reset_index(drop=True)
 )
 st.dataframe(out_table, width="stretch", height=560)
@@ -480,6 +489,6 @@ st.subheader("Export")
 st.download_button(
     "Download CSV (valid students)",
     data=out_table.to_csv(index=False),
-    file_name="students_with_groups_overall_number.csv",
+    file_name="students_with_groups_overall_score.csv",
     mime="text/csv",
 )

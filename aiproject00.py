@@ -170,11 +170,11 @@ def assign_groups_by_rank(df_sorted: pd.DataFrame, k: int) -> pd.Series:
 
 
 # -------------------------
-# Compute results with:
-# - per-test min-max normalization to 0..100
-# - weights normalized to 100% (10 & 5 -> 66.67% & 33.33%)
-# - missing scores NEGLECTED per student (renormalize weights per student)
-# - final Overall Score re-normalized across students so BEST=100, WORST=0
+# ✅ 핵심: "가중치 → fraction" 먼저 적용하고, 그 다음 Overall 정규화 (best=100, worst=0)
+# - per-test 점수는 0..100으로 정규화
+# - weights는 전체 합 100% 되도록 정규화 (2 vs 10이면 16.67% vs 83.33%)
+# - 빈칸은 0점 처리 (가중치에서 빼지 않음, 페널티)
+# - 마지막에 overall_raw를 학생들끼리 0..100으로 재정규화
 # -------------------------
 def compute_results(
     df: pd.DataFrame,
@@ -185,80 +185,53 @@ def compute_results(
 ):
     work = df.copy()
 
-    # numeric conversion
     for c in score_cols:
         work[c] = pd.to_numeric(work[c], errors="coerce")
 
     X = work[score_cols].to_numpy(dtype=float)
 
-    # normalize each test column to 0..100
+    # 1) 각 시험을 0..100으로 정규화
     S = minmax_0_100_by_column(X)  # NxD, NaN where missing
+    S0 = np.nan_to_num(S, nan=0.0)  # ✅ 빈칸은 0점 처리
 
+    # 2) weights 0..10 -> fraction(합 1.0)
     w010 = np.array(weights_0to10, dtype=float)
     if w010.shape[0] != len(score_cols):
         raise ValueError("Weights do not match selected score columns.")
-
     w010 = np.clip(w010, 0.0, 10.0)
+
     if float(w010.sum()) <= 0:
         raise ValueError("All weights are 0. Set at least one score weight above 0.")
 
-    # normalize weights to sum to 1 (100%)
-    w = w010 / w010.sum()
+    w = w010 / w010.sum()  # ✅ 합 1.0 (100%)
 
-    # per-student: ignore missing tests by renormalizing weights across present tests
-    present = ~np.isnan(S)  # NxD
-    w_present_sum = (present * w).sum(axis=1)  # N
+    # 3) 가중치 적용한 overall_raw 계산 (여기서 이미 weighting 반영 끝)
+    overall_raw = S0 @ w  # 0..100 범위 (weights sum=1, tests 0..100)
 
-    safe_denom = np.where(w_present_sum == 0, np.nan, w_present_sum)  # avoid divide by 0
-    w_student = (present * w) / safe_denom[:, None]  # NxD
-
-    # weighted overall in 0..100 scale (based on per-test normalized scores)
-    overall_raw = np.nansum(S * w_student, axis=1)  # NaN if no scores present
-
-    # final normalization across students: BEST=100, WORST=0
-    scored_mask = ~np.isnan(overall_raw)
-    final = np.full_like(overall_raw, np.nan, dtype=float)
-    if np.any(scored_mask):
-        vals = overall_raw[scored_mask].astype(float)
-        vmin = float(np.min(vals))
-        vmax = float(np.max(vals))
-        if vmax == vmin:
-            final[scored_mask] = 50.0
-        else:
-            final[scored_mask] = (vals - vmin) / (vmax - vmin) * 100.0
-
-    work["Overall Score"] = np.round(final, 2)
-
-    # sort results: scored first, best to worst
-    work_sorted = work.copy()
-    work_sorted["_scored"] = scored_mask.astype(int)
-    work_sorted = work_sorted.sort_values(
-        by=["_scored", "Overall Score", id_col],
-        ascending=[False, False, True],
-    ).copy()
-    work_sorted.drop(columns=["_scored"], inplace=True)
-
-    # group assignment only for scored students
-    scored_sorted = work_sorted[scored_mask].copy()
-    if len(scored_sorted) > 0:
-        scored_sorted["Group"] = assign_groups_by_rank(scored_sorted, k)
-        scored_sorted["Group Name"] = scored_sorted["Group"].apply(lambda g: f"Group {g}")
+    # 4) 마지막에 overall_raw를 학생들 사이에서 0..100으로 재정규화 (best=100, worst=0)
+    #    (전체가 같은 값이면 50)
+    vmin = float(np.min(overall_raw))
+    vmax = float(np.max(overall_raw))
+    if vmax == vmin:
+        overall_final = np.full_like(overall_raw, 50.0, dtype=float)
     else:
-        scored_sorted["Group"] = []
-        scored_sorted["Group Name"] = []
+        overall_final = (overall_raw - vmin) / (vmax - vmin) * 100.0
 
-    # merge back
-    work_sorted["Group"] = np.nan
-    work_sorted["Group Name"] = np.nan
-    work_sorted.loc[scored_sorted.index, "Group"] = scored_sorted["Group"].astype(int)
-    work_sorted.loc[scored_sorted.index, "Group Name"] = scored_sorted["Group Name"]
+    work["Overall Score"] = np.round(overall_final, 2)
 
-    # weights view (global normalized weights)
+    # sort: best first
+    work_sorted = work.sort_values(["Overall Score", id_col], ascending=[False, True]).copy()
+
+    # groups by rank
+    work_sorted["Group"] = assign_groups_by_rank(work_sorted, k)
+    work_sorted["Group Name"] = work_sorted["Group"].apply(lambda g: f"Group {g}")
+
+    # weights view
     weights_view = pd.DataFrame(
         {
             "score": score_cols,
             "weight_0_to_10": w010.astype(int),
-            "weight_%": np.round(w * 100.0, 2),
+            "weight_%": np.round(w * 100.0, 2),  # ✅ 2 vs 10이면 16.67 / 83.33
         }
     )
 
@@ -287,13 +260,13 @@ if st.session_state.get("_file_sig") != file_sig:
 
 df = read_csv_smart(file_bytes)
 
-# Column map so users can verify letters
+# Column map
 colmap = pd.DataFrame(
     {"Excel": [index_to_excel_col(i) for i in range(len(df.columns))], "Column title": list(df.columns)}
 )
 st.dataframe(colmap, height=260, width="stretch")
 
-# Name column (Excel letter)
+# Name column
 st.subheader("Student name column")
 id_letters = st.text_input("Type ONE Excel letter (example: E)", value="", key="id_letters_input")
 
@@ -308,12 +281,12 @@ if id_letters.strip():
         st.stop()
     id_col = df.columns[idx]
 else:
-    # silent fallback (no message)
+    # silent fallback
     df = df.copy()
     df["student_id"] = [f"S{i+1:03d}" for i in range(len(df))]
     id_col = "student_id"
 
-# Score columns (Excel letters)
+# Score columns
 st.subheader("Score columns")
 score_letters = st.text_input("Type Excel letters (example: A B C)", value="", key="score_letters_input")
 
@@ -336,7 +309,7 @@ if not score_cols:
     st.error("No valid score columns selected (don’t include the name column).")
     st.stop()
 
-# Weights (0-10 each) -> normalized into 100% automatically
+# Weights
 st.subheader("Weights (0–10 each)")
 weights_key = f"weights_{abs(hash(tuple(score_cols))) % 10**9}"
 default_df = pd.DataFrame({"score": score_cols, "weight_0_to_10": [0] * len(score_cols)})

@@ -61,23 +61,8 @@ def parse_excel_letters_input(text: str) -> list[int]:
 
 
 # -------------------------
-# Overall score conversion (0–100)
-# RELATIVE within the uploaded file: min-max normalization
-# Best proxy => 100, worst proxy => 0
-# -------------------------
-def proxy_to_0_100_minmax(proxy: np.ndarray) -> np.ndarray:
-    p = np.asarray(proxy, dtype=float)
-    mn = np.nanmin(p)
-    mx = np.nanmax(p)
-    if not np.isfinite(mn) or not np.isfinite(mx) or mx == mn:
-        # if everyone ties, give all 50
-        return np.full_like(p, 50.0, dtype=float)
-    return (p - mn) / (mx - mn) * 100.0
-
-
-# -------------------------
 # Robust CSV reader (AUTO header detection)
-# IMPORTANT: does NOT delete/drop ANY columns.
+# Does NOT delete/drop any columns.
 # -------------------------
 def _header_score(row: list[str]) -> float:
     cells = [("" if x is None else str(x).strip()) for x in row]
@@ -143,49 +128,54 @@ def read_csv_smart(file_bytes: bytes) -> pd.DataFrame:
         encoding=used_enc,
         engine="python",
     )
-
     df.columns = [str(c).strip() for c in df.columns]
     return df
 
 
 # -------------------------
-# Partial-score normalization + masked kmeans
+# Core math:
+# 1) For each selected test: normalize that test to 0..100 (within this file) using min-max, ignoring blanks
+# 2) For each student: compute weighted average across available tests (weights re-normalized per student)
+# 3) Normalize the composite to 0..100 within this file (relative ranking score)
 # -------------------------
-def standardize_with_nans(X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def minmax_0_100_by_column(X: np.ndarray) -> np.ndarray:
     """
-    Per-column z-score normalization using only non-missing values.
-    Missing values remain NaN (so they are ignored later).
+    Column-wise min-max scaling to 0..100 ignoring NaN.
+    If a column has no variance (max == min), all non-missing become 50.
     """
-    mask = ~np.isnan(X)
-    Z = X.astype(float).copy()
-
-    for j in range(X.shape[1]):
+    S = np.full_like(X, np.nan, dtype=float)
+    d = X.shape[1]
+    for j in range(d):
         col = X[:, j]
-        m = mask[:, j]
+        m = ~np.isnan(col)
         if m.sum() == 0:
-            Z[:, j] = np.nan
             continue
-        mean = np.mean(col[m])
-        std = np.std(col[m])
-        if std == 0 or not np.isfinite(std):
-            Z[m, j] = 0.0
-            Z[~m, j] = np.nan
+        mn = float(np.min(col[m]))
+        mx = float(np.max(col[m]))
+        if mx == mn:
+            S[m, j] = 50.0
         else:
-            Z[m, j] = (col[m] - mean) / std
-            Z[~m, j] = np.nan
-
-    return Z, mask
+            S[m, j] = (col[m] - mn) / (mx - mn) * 100.0
+    return S
 
 
-def masked_weighted_dist2(Z: np.ndarray, mask: np.ndarray, C: np.ndarray, w: np.ndarray) -> np.ndarray:
+def normalize_0_100_minmax(v: np.ndarray) -> np.ndarray:
+    v = np.asarray(v, dtype=float)
+    mn = np.nanmin(v)
+    mx = np.nanmax(v)
+    if not np.isfinite(mn) or not np.isfinite(mx) or mx == mn:
+        return np.full_like(v, 50.0, dtype=float)
+    return (v - mn) / (mx - mn) * 100.0
+
+
+def masked_weighted_dist2(S: np.ndarray, mask: np.ndarray, C: np.ndarray, w: np.ndarray) -> np.ndarray:
     """
-    Weighted squared distance, ignoring missing dims per student.
-    Normalize by sum of weights over available dims for fairness.
+    Weighted squared distance for KMeans, ignoring missing dims per student.
+    We normalize by sum of weights over available dims.
     """
-    n, d = Z.shape
+    n, d = S.shape
     k = C.shape[0]
     dist2 = np.full((n, k), np.inf, dtype=float)
-
     w = np.clip(w.astype(float), 0.0, None)
 
     for i in range(n):
@@ -194,102 +184,115 @@ def masked_weighted_dist2(Z: np.ndarray, mask: np.ndarray, C: np.ndarray, w: np.
         if wsum <= 0:
             continue
         for g in range(k):
-            diff = Z[i, m] - C[g, m]
+            diff = S[i, m] - C[g, m]
             dist2[i, g] = float(np.sum(w[m] * (diff ** 2)) / wsum)
 
     return dist2
 
 
-def masked_kmeans(Z: np.ndarray, mask: np.ndarray, weights: np.ndarray, k: int, max_iter: int = 40, seed: int = 0):
+def masked_kmeans(S: np.ndarray, mask: np.ndarray, weights: np.ndarray, k: int, max_iter: int = 50, seed: int = 0):
     """
-    KMeans variant that:
-    - works with NaNs by ignoring missing dimensions
-    - uses weighted distances
+    Simple KMeans variant that handles missing values by ignoring missing dimensions.
+    Uses weighted distances.
     """
     rng = np.random.default_rng(seed)
-    n, d = Z.shape
+    n, d = S.shape
 
     init_idx = rng.choice(n, size=k, replace=(n < k))
     C = np.zeros((k, d), dtype=float)
     for g, idx in enumerate(init_idx):
         m = mask[idx]
-        C[g, m] = Z[idx, m]
+        C[g, m] = S[idx, m]
 
     labels = np.full(n, -1, dtype=int)
 
     for _ in range(max_iter):
-        dist2 = masked_weighted_dist2(Z, mask, C, weights)
+        dist2 = masked_weighted_dist2(S, mask, C, weights)
         new_labels = np.argmin(dist2, axis=1)
-
         if np.array_equal(new_labels, labels):
             break
         labels = new_labels
 
+        # update centroids
         for g in range(k):
             idxs = np.where(labels == g)[0]
             if len(idxs) == 0:
                 ridx = rng.integers(0, n)
                 C[g, :] = 0.0
                 m = mask[ridx]
-                C[g, m] = Z[ridx, m]
+                C[g, m] = S[ridx, m]
                 continue
 
             for j in range(d):
                 mj = mask[idxs, j]
                 if np.any(mj):
-                    C[g, j] = float(np.mean(Z[idxs[mj], j]))
+                    C[g, j] = float(np.mean(S[idxs[mj], j]))
                 else:
                     C[g, j] = 0.0
 
     return labels, C
 
 
-def compute_groups_partial(df, id_col, selected_score_cols, k, cap_pct, weights_0to10):
+def compute_groups(df, id_col, score_cols, k, cap_pct, weights_0to10):
     work = df.copy()
 
-    # Convert selected scores to numeric; blanks become NaN
-    for c in selected_score_cols:
+    # numeric conversion
+    for c in score_cols:
         work[c] = pd.to_numeric(work[c], errors="coerce")
 
-    X = work[selected_score_cols].to_numpy(dtype=float)
-    Z, mask = standardize_with_nans(X)
+    X = work[score_cols].to_numpy(dtype=float)
+
+    # 1) per-test normalize to 0..100 (handles “scores up to 200” etc.)
+    S = minmax_0_100_by_column(X)  # NxD, NaN where missing
 
     raw = np.array(weights_0to10, dtype=float)
-    if raw.shape[0] != len(selected_score_cols):
-        raise ValueError("Weights do not match the selected score columns.")
+    if raw.shape[0] != len(score_cols):
+        raise ValueError("Weights do not match selected score columns.")
     raw = np.clip(raw, 0.0, None)
+    if raw.sum() <= 0:
+        raise ValueError("All weights are 0. Set at least one weight above 0.")
 
-    usable_w = (raw > 0)
+    weights = (raw / raw.sum()).astype(float)
+    weights_view = pd.DataFrame({"score": score_cols, "final_weight_%": np.round(weights * 100.0, 2)})
+
+    # valid student = has at least one available test with weight > 0
+    mask = ~np.isnan(S)
+    usable_w = (weights > 0)
     row_has_any = np.any(mask[:, usable_w], axis=1) if np.any(usable_w) else np.zeros(len(work), dtype=bool)
 
-    # Excluded = students who have no usable score across selected+weighted tests
-    excluded = work.loc[~row_has_any, [id_col] + selected_score_cols].copy()
+    excluded = work.loc[~row_has_any, [id_col] + score_cols].copy()
     valid_work = work.loc[row_has_any].copy()
 
-    Z_valid = Z[row_has_any]
+    S_valid = S[row_has_any]
     mask_valid = mask[row_has_any]
     n_valid = len(valid_work)
 
     if n_valid == 0:
-        raise ValueError("No students have any usable scores (all selected scores are blank or weights are 0).")
+        raise ValueError("No students have any usable selected scores.")
     if k > n_valid:
         raise ValueError(f"Number of groups ({k}) cannot exceed valid students ({n_valid}).")
-    if raw.sum() <= 0:
-        raise ValueError("All weights are 0. Set at least one weight above 0.")
 
-    # Normalize weights across all selected tests (global weights)
-    weights = (raw / raw.sum()).astype(float)
-    weights_view = pd.DataFrame({"score": selected_score_cols, "final_weight_%": np.round(weights * 100.0, 2)})
+    # 2) composite per student (whole bundle), weights re-normalized per student over available tests
+    composite = np.full(n_valid, np.nan, dtype=float)
+    for i in range(n_valid):
+        m = mask_valid[i] & (weights > 0)
+        wsum = float(np.sum(weights[m]))
+        if wsum <= 0:
+            continue
+        wrow = weights[m] / wsum
+        composite[i] = float(np.sum(wrow * S_valid[i, m]))
 
-    # KMeans clustering
-    labels, C = masked_kmeans(Z_valid, mask_valid, weights, k=k, max_iter=50, seed=0)
+    # 3) overall score = relative within file/class using min-max on composite
+    overall_score = normalize_0_100_minmax(composite)
+    valid_work["Overall Score"] = np.round(overall_score, 2)
+    valid_work["_level_proxy"] = overall_score  # used for group ranking
 
-    # Optional cap assignment (max % per group)
-    dist2 = masked_weighted_dist2(Z_valid, mask_valid, C, weights)
+    # clustering on the same normalized-per-test space (S_valid)
+    labels, C = masked_kmeans(S_valid, mask_valid, weights, k=k, max_iter=50, seed=0)
+    dist2 = masked_weighted_dist2(S_valid, mask_valid, C, weights)
     dists = np.sqrt(np.maximum(dist2, 0.0))
 
-    cap_adjust_note = None
-
+    cap_note = None
     if cap_pct == 0:
         assigned = labels
     else:
@@ -299,7 +302,7 @@ def compute_groups_partial(df, id_col, selected_score_cols, k, cap_pct, weights_
         min_cap = int(np.ceil(n_valid / k))
         if cap < min_cap:
             cap = min_cap
-            cap_adjust_note = (
+            cap_note = (
                 f"Max % per group was too small to fit all valid students. "
                 f"Auto-adjusted to at least {int(np.ceil(100 * cap / n_valid))}%."
             )
@@ -323,24 +326,7 @@ def compute_groups_partial(df, id_col, selected_score_cols, k, cap_pct, weights_
 
     valid_work["_cluster_internal"] = assigned
 
-    # Weighted normalized performance per student, allowing partial scores:
-    # renormalize weights per student over the tests that are present
-    overall_proxy = np.zeros(n_valid, dtype=float)
-    for i in range(n_valid):
-        m = mask_valid[i] & (weights > 0)
-        wsum = float(np.sum(weights[m]))
-        if wsum <= 0:
-            overall_proxy[i] = 0.0
-        else:
-            wrow = weights[m] / wsum
-            overall_proxy[i] = float(np.sum(wrow * Z_valid[i, m]))
-
-    valid_work["_level_proxy"] = overall_proxy
-
-    # Overall Score (0–100) AFTER weighting: min-max within this file
-    valid_work["Overall Score"] = np.round(proxy_to_0_100_minmax(overall_proxy), 2)
-
-    # Group numbering: Group 1 = best mean proxy
+    # Group numbering: Group 1 = best mean Overall Score
     order_best = (
         valid_work.groupby("_cluster_internal")["_level_proxy"]
         .mean()
@@ -352,7 +338,7 @@ def compute_groups_partial(df, id_col, selected_score_cols, k, cap_pct, weights_
     valid_work["Group"] = valid_work["_cluster_internal"].map(cluster_to_groupnum).astype(int)
     valid_work["Group Name"] = valid_work["Group"].apply(lambda g: f"Group {g}")
 
-    return valid_work, excluded, weights_view, cap_adjust_note
+    return valid_work, excluded, weights_view, cap_note
 
 
 # -------------------------
@@ -369,33 +355,24 @@ if uploaded is None:
 file_bytes = uploaded.getvalue()
 file_sig = (len(file_bytes), hash(file_bytes[:5000]))
 
-# Reset widgets when file changes
+# Reset widgets when file changes (so it doesn't keep old selections)
 if st.session_state.get("_file_sig") != file_sig:
     st.session_state["_file_sig"] = file_sig
     for kk in list(st.session_state.keys()):
-        if kk.startswith(
-            (
-                "id_letters_input",
-                "selected_letters_input",
-                "k_groups",
-                "limit_group_size",
-                "cap_pct",
-                "weights_0to10_",
-            )
-        ):
+        if kk.startswith(("id_letters_input", "selected_letters_input", "k_groups", "limit_group_size", "cap_pct", "weights_")):
             st.session_state.pop(kk, None)
 
 df = read_csv_smart(file_bytes)
 
-# Student name column
+# Student name column by Excel letter
 st.subheader("Student name column (Excel letter)")
-st.caption("Type ONE Excel letter for the student name column. Example: A  OR  AB")
+st.caption("Type ONE Excel letter for the student name column. Example: A or AB")
 id_letters = st.text_input("Student name column", value="", key="id_letters_input")
 
 if id_letters.strip():
     idxs = parse_excel_letters_input(id_letters)
     if len(idxs) != 1:
-        st.error("Please type exactly ONE column letter for the student name column (example: A or AB).")
+        st.error("Please type exactly ONE column letter for the student name column.")
         st.stop()
     idx = idxs[0]
     if idx < 0 or idx >= len(df.columns):
@@ -408,18 +385,12 @@ if id_letters.strip():
         height=110,
     )
 else:
-    lowered = [str(c).strip().lower() for c in df.columns]
-    id_col = None
-    for cand in ["student_id", "student id", "id", "name", "student name", "student number"]:
-        if cand in lowered:
-            id_col = df.columns[lowered.index(cand)]
-            break
-    if id_col is None:
-        df = df.copy()
-        df["student_id"] = [f"S{i+1:03d}" for i in range(len(df))]
-        id_col = "student_id"
+    # fallback: create an id column silently
+    df = df.copy()
+    df["student_id"] = [f"S{i+1:03d}" for i in range(len(df))]
+    id_col = "student_id"
 
-# Score columns selection
+# Score columns selection by Excel letters
 st.subheader("Select score columns (Excel letters)")
 st.caption("Examples: A, B, C  OR  A B C")
 letters_text = st.text_input("Type Excel letters for the score columns to include", value="", key="selected_letters_input")
@@ -434,9 +405,9 @@ try:
                 raise ValueError(f"Column out of range: {index_to_excel_col(i)} (file has {len(df.columns)} columns)")
         selected_score_cols = [df.columns[i] for i in idxs]
 
+        # If user accidentally included id column in scores, remove it (without deleting from df)
         if id_col in selected_score_cols:
             selected_score_cols = [c for c in selected_score_cols if c != id_col]
-            st.warning("You included the student name column in the score list — it was removed automatically.")
 
         st.dataframe(
             pd.DataFrame(
@@ -452,10 +423,10 @@ if not selected_score_cols:
     st.info("Type at least 1 Excel column letter to continue.")
     st.stop()
 
-# Weights per selected score
+# Weights per selected score (0-10)
 st.subheader("Weights (0–10 per selected score)")
 st.caption("0 = off • 10 = strongest (normalized automatically)")
-weights_key = f"weights_0to10_{abs(hash(tuple(selected_score_cols))) % 10**9}"
+weights_key = f"weights_{abs(hash(tuple(selected_score_cols))) % 10**9}"
 
 if len(selected_score_cols) == 1:
     weights_0to10 = np.array([10], dtype=int)
@@ -486,10 +457,10 @@ cap_pct = st.slider("Max % per group", 1, 40, 20, key="cap_pct") if limit_group_
 
 try:
     with st.spinner("Recalculating…"):
-        valid_work, excluded, weights_view, cap_note = compute_groups_partial(
+        valid_work, excluded, weights_view, cap_note = compute_groups(
             df=df,
             id_col=id_col,
-            selected_score_cols=selected_score_cols,
+            score_cols=selected_score_cols,
             k=k,
             cap_pct=cap_pct,
             weights_0to10=weights_0to10,

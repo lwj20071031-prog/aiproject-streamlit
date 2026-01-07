@@ -62,15 +62,12 @@ def parse_excel_letters_input(text: str) -> list[int]:
 
 # -------------------------
 # Overall score conversion (0–100)
-# Best student = 100, worst = 0 (min-max normalization)
+# Use sigmoid so average ~50, avoids “max becomes 100” effect.
 # -------------------------
-def proxy_to_0_100_minmax(proxy: np.ndarray) -> np.ndarray:
+def proxy_to_0_100_sigmoid(proxy: np.ndarray) -> np.ndarray:
     p = np.asarray(proxy, dtype=float)
-    mn = np.nanmin(p)
-    mx = np.nanmax(p)
-    if not np.isfinite(mn) or not np.isfinite(mx) or mx == mn:
-        return np.full_like(p, 50.0, dtype=float)
-    return (p - mn) / (mx - mn) * 100.0
+    p = np.clip(p, -6, 6)  # prevents exp overflow; still maps to ~0.25..99.75
+    return 100.0 / (1.0 + np.exp(-p))
 
 
 # -------------------------
@@ -150,6 +147,10 @@ def read_csv_smart(file_bytes: bytes) -> pd.DataFrame:
 # Partial-score normalization + masked kmeans
 # -------------------------
 def standardize_with_nans(X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Per-column z-score normalization using only non-missing values.
+    Missing values remain NaN (so they are ignored later).
+    """
     mask = ~np.isnan(X)
     Z = X.astype(float).copy()
 
@@ -172,6 +173,10 @@ def standardize_with_nans(X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
 
 def masked_weighted_dist2(Z: np.ndarray, mask: np.ndarray, C: np.ndarray, w: np.ndarray) -> np.ndarray:
+    """
+    Weighted squared distance, ignoring missing dims per student.
+    We also normalize by sum of weights over available dims so distance scale stays fair.
+    """
     n, d = Z.shape
     k = C.shape[0]
     dist2 = np.full((n, k), np.inf, dtype=float)
@@ -191,6 +196,11 @@ def masked_weighted_dist2(Z: np.ndarray, mask: np.ndarray, C: np.ndarray, w: np.
 
 
 def masked_kmeans(Z: np.ndarray, mask: np.ndarray, weights: np.ndarray, k: int, max_iter: int = 40, seed: int = 0):
+    """
+    KMeans variant that:
+    - works with NaNs by ignoring missing dimensions
+    - uses weighted distances
+    """
     rng = np.random.default_rng(seed)
     n, d = Z.shape
 
@@ -232,6 +242,7 @@ def masked_kmeans(Z: np.ndarray, mask: np.ndarray, weights: np.ndarray, k: int, 
 def compute_groups_partial(df, id_col, selected_score_cols, k, cap_pct, weights_0to10):
     work = df.copy()
 
+    # Convert selected scores to numeric; blanks become NaN
     for c in selected_score_cols:
         work[c] = pd.to_numeric(work[c], errors="coerce")
 
@@ -246,6 +257,7 @@ def compute_groups_partial(df, id_col, selected_score_cols, k, cap_pct, weights_
     usable_w = (raw > 0)
     row_has_any = np.any(mask[:, usable_w], axis=1) if np.any(usable_w) else np.zeros(len(work), dtype=bool)
 
+    # Excluded = students who have no usable score across selected+weighted tests
     excluded = work.loc[~row_has_any, [id_col] + selected_score_cols].copy()
     valid_work = work.loc[row_has_any].copy()
 
@@ -260,10 +272,14 @@ def compute_groups_partial(df, id_col, selected_score_cols, k, cap_pct, weights_
     if raw.sum() <= 0:
         raise ValueError("All weights are 0. Set at least one weight above 0.")
 
+    # Normalize weights across all selected tests (global weights)
     weights = (raw / raw.sum()).astype(float)
     weights_view = pd.DataFrame({"score": selected_score_cols, "final_weight_%": np.round(weights * 100.0, 2)})
 
+    # KMeans clustering
     labels, C = masked_kmeans(Z_valid, mask_valid, weights, k=k, max_iter=50, seed=0)
+
+    # Optional cap assignment (max % per group)
     dist2 = masked_weighted_dist2(Z_valid, mask_valid, C, weights)
     dists = np.sqrt(np.maximum(dist2, 0.0))
 
@@ -302,6 +318,8 @@ def compute_groups_partial(df, id_col, selected_score_cols, k, cap_pct, weights_
 
     valid_work["_cluster_internal"] = assigned
 
+    # Weighted normalized performance per student, allowing partial scores:
+    # we renormalize weights *per student* over the tests that are present
     overall_proxy = np.zeros(n_valid, dtype=float)
     for i in range(n_valid):
         m = mask_valid[i] & (weights > 0)
@@ -314,9 +332,10 @@ def compute_groups_partial(df, id_col, selected_score_cols, k, cap_pct, weights_
 
     valid_work["_level_proxy"] = overall_proxy
 
-    # Overall Score: min-max normalized to 0..100
-    valid_work["Overall Score"] = np.round(proxy_to_0_100_minmax(overall_proxy), 2)
+    # Overall Score (0–100) AFTER weighting: sigmoid mapping
+    valid_work["Overall Score"] = np.round(proxy_to_0_100_sigmoid(overall_proxy), 2)
 
+    # Group numbering: Group 1 = best mean proxy
     order_best = (
         valid_work.groupby("_cluster_internal")["_level_proxy"]
         .mean()
@@ -349,7 +368,16 @@ file_sig = (len(file_bytes), hash(file_bytes[:5000]))
 if st.session_state.get("_file_sig") != file_sig:
     st.session_state["_file_sig"] = file_sig
     for kk in list(st.session_state.keys()):
-        if kk.startswith(("id_letters_input", "selected_letters_input", "k_groups", "limit_group_size", "cap_pct", "weights_0to10_")):
+        if kk.startswith(
+            (
+                "id_letters_input",
+                "selected_letters_input",
+                "k_groups",
+                "limit_group_size",
+                "cap_pct",
+                "weights_0to10_",
+            )
+        ):
             st.session_state.pop(kk, None)
 
 df = read_csv_smart(file_bytes)

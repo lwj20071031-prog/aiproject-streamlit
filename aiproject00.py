@@ -62,14 +62,15 @@ def parse_excel_letters_input(text: str) -> list[int]:
 
 # -------------------------
 # Overall score conversion (0–100)
-# We use percentile rank (stable) instead of min-max.
-# Best student gets 100, worst gets ~0.
+# Best student = 100, worst = 0 (min-max normalization)
 # -------------------------
-def proxy_to_0_100_percentile(proxy: np.ndarray) -> np.ndarray:
-    s = pd.Series(proxy)
-    # pct=True gives [0,1]; rank higher proxy => higher percentile
-    pct = s.rank(method="average", pct=True, ascending=True)  # ascending=True: bigger proxy => bigger pct
-    return (pct * 100.0).to_numpy(dtype=float)
+def proxy_to_0_100_minmax(proxy: np.ndarray) -> np.ndarray:
+    p = np.asarray(proxy, dtype=float)
+    mn = np.nanmin(p)
+    mx = np.nanmax(p)
+    if not np.isfinite(mn) or not np.isfinite(mx) or mx == mn:
+        return np.full_like(p, 50.0, dtype=float)
+    return (p - mn) / (mx - mn) * 100.0
 
 
 # -------------------------
@@ -301,7 +302,6 @@ def compute_groups_partial(df, id_col, selected_score_cols, k, cap_pct, weights_
 
     valid_work["_cluster_internal"] = assigned
 
-    # Weighted normalized performance (z-space) per student (partial scores allowed)
     overall_proxy = np.zeros(n_valid, dtype=float)
     for i in range(n_valid):
         m = mask_valid[i] & (weights > 0)
@@ -314,10 +314,9 @@ def compute_groups_partial(df, id_col, selected_score_cols, k, cap_pct, weights_
 
     valid_work["_level_proxy"] = overall_proxy
 
-    # Overall Score: percentile-based 0–100
-    valid_work["Overall Score"] = np.round(proxy_to_0_100_percentile(overall_proxy), 2)
+    # Overall Score: min-max normalized to 0..100
+    valid_work["Overall Score"] = np.round(proxy_to_0_100_minmax(overall_proxy), 2)
 
-    # Group 1 = best cluster (by mean proxy)
     order_best = (
         valid_work.groupby("_cluster_internal")["_level_proxy"]
         .mean()
